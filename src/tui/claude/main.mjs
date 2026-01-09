@@ -1,0 +1,3392 @@
+#!/usr/bin/env node
+
+/**
+ * Open Claude Code TUI - Main conversation interface
+ */
+
+import React, { useState, useCallback, useEffect, useMemo, useRef, memo, Component } from 'react'
+import { Box, Text, render, useInput } from 'ink'
+import { randomUUID } from 'crypto'
+import chalk from 'chalk'
+
+// Our modules
+import { createMessage, normalizeMessages, getLastMessage } from '../../utils/messages.mjs'
+import { streamConversation } from '../../api/streaming.mjs'
+import { getAllTools } from '../../tools/index.mjs'
+import { formatError } from '../../utils/errors.mjs'
+import { loadConfig, saveConfig, VERSION, isFastMode, setFastMode, getFastModeModel, getFastModeDisplayName, modelSupportsFastMode } from '../../core/config.mjs'
+import { runHooks } from '../../core/hooks.mjs'
+import { getLocalCommands, processCommand as execCommand } from '../../cli/commands.mjs'
+import { glob } from 'glob'
+import { basename, relative, join } from 'path'
+import path from 'path'
+import { homedir } from 'os'
+import { readFileSync, existsSync, readdirSync, writeFileSync, mkdirSync } from 'fs'
+import { execFileSync } from 'child_process'
+import { authenticateWithOAuth, getAuthInfo, logout as oauthLogout, getValidToken, setOAuthMode } from '../../auth/oauth.mjs'
+import { resetClient } from '../../api/client.mjs'
+import { getSystemPromptIntro, getSystemInstructions } from '../../prompts/system.mjs'
+import { FastModeToggle } from './components/fast-mode-toggle.mjs'
+import { PromptFooter } from './components/prompt-footer.mjs'
+import { McpManager } from './components/mcp-manager.mjs'
+import { ConfigManager } from './components/config-manager.mjs'
+import { ApprovedToolsManager } from './components/approved-tools-manager.mjs'
+import { SessionPicker } from './components/session-picker.mjs'
+import { PluginManager } from './components/plugin-manager.mjs'
+import { AgentManager } from './components/agent-manager.mjs'
+import { ToolsManager } from './components/tools-manager.mjs'
+import { ContextManager } from './components/context-manager.mjs'
+import { SteeringQuestions } from './components/steering-questions.mjs'
+import { addMcpServer, removeMcpServer, getAllMcpServers, connectToMcpServer, updateServerStartupMode } from '../../integration/mcp.mjs'
+import {
+  getRegisteredPlugins,
+  getPluginStatus,
+  loadPluginManifest,
+  enablePlugin as registryEnablePlugin,
+  disablePlugin as registryDisablePlugin,
+} from '../../plugins/registry.mjs'
+import { installFromNpm, installFromLocal, uninstallPlugin } from '../../plugins/installer.mjs'
+import { isBundledPlugin, getSamplePluginPath } from '../../plugins/discovery.mjs'
+import { deleteCustomAgent } from '../../agents/subagent.mjs'
+import { loadSettings, saveSettings, getDisabledContextItems, toggleContextItem, isContextItemDisabled, getCustomContextItems, addCustomContextItem, removeCustomContextItem } from '../../core/config.mjs'
+import { getTotalContextTokens } from '../../utils/tokens.mjs'
+import * as sessions from '../../sessions/index.mjs'
+
+/**
+ * Error Boundary - Catches React errors and displays them gracefully
+ */
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { hasError: false, error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('[TUI Error]', error)
+    console.error('[Error Info]', errorInfo)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return React.createElement(Box, { flexDirection: 'column', padding: 1 },
+        React.createElement(Text, { color: 'red', bold: true }, '✗ UI Error'),
+        React.createElement(Text, null, this.state.error?.message || 'Unknown error'),
+        React.createElement(Text, { color: 'gray', dimColor: true }, '\nPress Ctrl+C to exit')
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+/**
+ * Load custom commands from ~/.openclaude/commands/*.md and ~/.claude/commands/*.md
+ * Items from .openclaude take priority. Each item is tagged with `source`.
+ */
+function loadCustomCommands() {
+  const customCommands = []
+  const seen = new Set()
+
+  // Scan dirs in priority order: openclaude first, then claude
+  const commandsDirs = [
+    { dir: join(homedir(), '.openclaude', 'commands'), source: 'openclaude' },
+    { dir: join(homedir(), '.claude', 'commands'), source: 'claude' },
+  ]
+
+  for (const { dir: commandsDir, source } of commandsDirs) {
+    if (!existsSync(commandsDir)) continue
+
+    try {
+      const files = readdirSync(commandsDir)
+      for (const file of files) {
+        if (!file.endsWith('.md') || file.startsWith('.')) continue
+
+        const name = file.replace('.md', '')
+
+        // If already loaded from higher-priority dir, mark as 'both'
+        if (seen.has(name)) {
+          const existing = customCommands.find(c => c.name === name)
+          if (existing) existing.source = 'both'
+          continue
+        }
+        seen.add(name)
+
+        const filePath = join(commandsDir, file)
+
+        // Read first line for description
+        let description = ''
+        try {
+          const content = readFileSync(filePath, 'utf8')
+          const firstLine = content.split('\n')[0]
+          // Extract description from # heading or first line
+          if (firstLine.startsWith('#')) {
+            description = firstLine.replace(/^#+\s*/, '').trim()
+          } else {
+            description = firstLine.trim().slice(0, 60)
+          }
+        } catch (e) {
+          description = `Custom command: ${name}`
+        }
+
+        customCommands.push({
+          name,
+          description,
+          source,
+          isEnabled: true,
+          isCustom: true,
+          filePath,
+          userFacingName() { return name },
+          async call() {
+            try {
+              const content = readFileSync(filePath, 'utf8')
+              return `Running custom command: ${name}\n\n${content}`
+            } catch (e) {
+              return `Error loading command ${name}: ${e.message}`
+            }
+          }
+        })
+      }
+    } catch (e) {
+      console.error('[CustomCommands] Failed to load from', commandsDir, ':', e.message)
+    }
+  }
+
+  return customCommands
+}
+
+// Available models for selection
+const AVAILABLE_MODELS = [
+  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', description: 'Latest Sonnet - Fast and capable' },
+  { id: 'claude-opus-4-6', name: 'Claude Opus 4.6', description: 'Most capable - latest Opus' },
+  { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', description: 'Previous Opus generation' },
+  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', description: 'Fast and efficient' },
+  { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', description: 'Previous Sonnet generation' },
+  { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', description: 'Legacy - lightweight' },
+  { id: 'claude-3-opus-20240229', name: 'Claude 3 Opus', description: 'Legacy - previous flagship' }
+]
+
+/**
+ * Message Selector - Select a message to fork conversation from
+ */
+function MessageSelector({ messages, onSelect, onCancel }) {
+  const userMessages = messages.filter(m => m.type === 'user')
+  const [selectedIndex, setSelectedIndex] = useState(Math.max(0, userMessages.length - 1))
+
+  useInput((char, key) => {
+    if (key.escape) {
+      onCancel()
+      return
+    }
+    if (key.upArrow) {
+      setSelectedIndex(i => Math.max(0, i - 1))
+      return
+    }
+    if (key.downArrow) {
+      setSelectedIndex(i => Math.min(userMessages.length - 1, i + 1))
+      return
+    }
+    if (key.return) {
+      const selectedMessage = userMessages[selectedIndex]
+      // Find this message's index in the full messages array
+      const fullIndex = messages.findIndex(m => m.uuid === selectedMessage.uuid)
+      onSelect(fullIndex)
+      return
+    }
+  })
+
+  if (userMessages.length === 0) {
+    return React.createElement(Box, {
+      flexDirection: 'column',
+      borderStyle: 'round',
+      borderColor: THEME.claude,
+      padding: 1,
+      marginTop: 1
+    },
+      React.createElement(Text, { key: 'title', bold: true, color: THEME.claude }, '⏺ Fork Conversation'),
+      React.createElement(Text, { key: 'message' }, 'No messages to fork from'),
+      React.createElement(Text, { key: 'help', dimColor: true, marginTop: 1 }, 'Press Escape to cancel')
+    )
+  }
+
+  return React.createElement(Box, {
+    flexDirection: 'column',
+    borderStyle: 'round',
+    borderColor: THEME.claude,
+    padding: 1,
+    marginTop: 1
+  },
+    React.createElement(Text, { key: 'title', bold: true, color: THEME.claude }, '⏺ Fork Conversation'),
+    React.createElement(Text, { key: 'subtitle', dimColor: true }, 'Select a message to fork from:'),
+    React.createElement(Box, { key: 'spacer1', marginTop: 1 }),
+    React.createElement(Box, { key: 'messages', flexDirection: 'column' },
+      userMessages.map((msg, idx) => {
+        const isSelected = idx === selectedIndex
+        const preview = (msg.content || msg.message?.content?.[0]?.text || 'Empty message')
+          .split('\n')[0]
+          .slice(0, 60)
+        const truncated = preview.length === 60 ? preview + '...' : preview
+
+        return React.createElement(Box, {
+          key: msg.uuid || idx,
+          flexDirection: 'column',
+          marginBottom: idx < userMessages.length - 1 ? 1 : 0
+        },
+          React.createElement(Text, {
+            color: isSelected ? THEME.suggestion : undefined,
+            inverse: isSelected,
+          },
+            isSelected ? ' → ' : '   ',
+            `Message ${idx + 1}`
+          ),
+          React.createElement(Text, {
+            dimColor: !isSelected,
+            color: isSelected ? THEME.suggestion : undefined
+          }, '     ', truncated)
+        )
+      })
+    ),
+    React.createElement(Box, { key: 'spacer2', marginTop: 1 }),
+    React.createElement(Text, { key: 'help', dimColor: true }, '↑↓ Navigate · Enter to fork · Escape to cancel')
+  )
+}
+
+/**
+ * Interactive Model Selector Overlay
+ */
+function ModelSelector({ currentModel, onSelect, onCancel }) {
+  const [selectedIndex, setSelectedIndex] = useState(
+    Math.max(0, AVAILABLE_MODELS.findIndex(m => m.id === currentModel))
+  )
+
+  useInput((char, key) => {
+    if (key.escape) {
+      onCancel()
+      return
+    }
+    if (key.upArrow) {
+      setSelectedIndex(i => Math.max(0, i - 1))
+      return
+    }
+    if (key.downArrow) {
+      setSelectedIndex(i => Math.min(AVAILABLE_MODELS.length - 1, i + 1))
+      return
+    }
+    if (key.return) {
+      onSelect(AVAILABLE_MODELS[selectedIndex])
+      return
+    }
+  })
+
+  return React.createElement(Box, {
+    flexDirection: 'column',
+    borderStyle: 'round',
+    borderColor: THEME.claude,
+    padding: 1,
+    marginTop: 1
+  },
+    React.createElement(Text, { key: 'title', bold: true, color: THEME.claude }, '⏺ Select Model'),
+    React.createElement(Text, { key: 'current', dimColor: true }, 'Current: ', currentModel),
+    React.createElement(Box, { key: 'spacer', marginTop: 1 }),
+    React.createElement(Box, { key: 'models', flexDirection: 'column' },
+      AVAILABLE_MODELS.map((model, idx) => {
+        const isSelected = idx === selectedIndex
+        const isCurrent = model.id === currentModel
+        return React.createElement(Box, {
+          key: model.id,
+          flexDirection: 'column',
+          marginBottom: 0
+        },
+          React.createElement(Text, {
+            color: isSelected ? THEME.suggestion : (isCurrent ? THEME.success : undefined),
+            inverse: isSelected,
+            bold: isCurrent
+          },
+            isSelected ? ' → ' : '   ',
+            model.name,
+            ' (',
+            model.id.split('-').slice(-1)[0],
+            ')',
+            isCurrent ? ' [current]' : ''
+          ),
+          React.createElement(Text, {
+            dimColor: !isSelected,
+            color: isSelected ? THEME.suggestion : undefined
+          }, '     ', model.description)
+        )
+      })
+    ),
+    React.createElement(Box, { key: 'help', marginTop: 1 },
+      React.createElement(Text, { dimColor: true }, '↑↓ to navigate · Enter to select · Esc to cancel')
+    )
+  )
+}
+
+// OAuth options for AuthSelector
+const AUTH_OPTIONS = [
+  {
+    id: 'claude',
+    name: 'Claude Max/Pro',
+    description: 'Use your Claude Max ($100/mo) or Pro ($20/mo) subscription for unlimited usage',
+    icon: '🌟'
+  },
+  {
+    id: 'anthropic',
+    name: 'Console OAuth',
+    description: 'Billed based on API usage through your Console account',
+    icon: '🔑'
+  }
+]
+
+/**
+ * Interactive Auth Selector Overlay
+ * Shows when /login is called - lets user choose between auth methods
+ */
+function AuthSelector({ onSelect, onCancel }) {
+  const [selectedIndex, setSelectedIndex] = useState(0)
+
+  useInput((char, key) => {
+    if (key.escape) {
+      onCancel()
+      return
+    }
+    if (key.upArrow) {
+      setSelectedIndex(i => Math.max(0, i - 1))
+      return
+    }
+    if (key.downArrow) {
+      setSelectedIndex(i => Math.min(AUTH_OPTIONS.length - 1, i + 1))
+      return
+    }
+    if (key.return) {
+      onSelect(AUTH_OPTIONS[selectedIndex])
+      return
+    }
+  })
+
+  return React.createElement(Box, {
+    flexDirection: 'column',
+    borderStyle: 'round',
+    borderColor: THEME.claude,
+    padding: 1,
+    marginTop: 1
+  },
+    React.createElement(Text, { key: 'title', bold: true, color: THEME.claude }, '⏺ Sign in to Claude'),
+    React.createElement(Text, { key: 'subtitle', dimColor: true }, 'Choose your authentication method:'),
+    React.createElement(Box, { key: 'spacer', marginTop: 1 }),
+    React.createElement(Box, { key: 'options', flexDirection: 'column' },
+      AUTH_OPTIONS.map((option, idx) => {
+        const isSelected = idx === selectedIndex
+        return React.createElement(Box, {
+          key: option.id,
+          flexDirection: 'column',
+          marginBottom: 1
+        },
+          React.createElement(Text, {
+            color: isSelected ? THEME.suggestion : undefined,
+            inverse: isSelected,
+            bold: isSelected
+          },
+            isSelected ? ' → ' : '   ',
+            option.icon, ' ',
+            option.name
+          ),
+          React.createElement(Text, {
+            dimColor: !isSelected,
+            color: isSelected ? THEME.suggestion : undefined
+          }, '     ', option.description)
+        )
+      })
+    ),
+    React.createElement(Box, { key: 'help', marginTop: 1 },
+      React.createElement(Text, { dimColor: true }, '↑↓ to navigate · Enter to select · Esc to cancel')
+    )
+  )
+}
+
+// Maximum number of suggestions to show at once
+const MAX_SUGGESTIONS = 20
+const VISIBLE_SUGGESTIONS = 10 // Show 10 at a time, scroll the rest
+
+// Standard slash commands — TUI-only commands that need direct access to TUI context.
+// Commands that exist in localCommands (from commands.mjs) are NOT duplicated here.
+// The merge order is: [...localCommands, ...standardCommands, ...customCommands]
+// so localCommands take precedence for text-based handlers, and standardCommands
+// only add TUI-specific overlay wrappers or TUI-only commands (help, quit, version).
+const standardCommands = [
+  {
+    name: 'help',
+    description: 'Show available commands and help information',
+    isEnabled: true,
+    userFacingName() { return 'help' },
+    async call(closeOverlay, context) {
+      // Build help dynamically from all available commands
+      const commandHelp = [
+        ['help',           'Show this help message'],
+        ['init',           'Create a CLAUDE.md file for this project'],
+        ['model',          'Switch AI models (or /model <name>)'],
+        ['login',          'Sign in to Claude (OAuth or API key)'],
+        ['logout',         'Sign out of Claude'],
+        ['auth',           'Show authentication status'],
+        ['status',         'Show project and session status'],
+        ['cost',           'Show API usage and cost for this session'],
+        ['compact',        'Compact conversation to free context space'],
+        ['clear',          'Clear conversation history'],
+        ['config',         'Manage configuration (get/set/remove/list)'],
+        ['permissions',    'Show and manage permission mode'],
+        ['approved-tools', 'Manage tool approvals (list/remove)'],
+        ['mcp',            'Manage MCP servers (list/add/remove)'],
+        ['fast',           'Toggle fast mode'],
+        ['memory',         'Show or edit CLAUDE.md memory files'],
+        ['context',        'Show context window usage'],
+        ['doctor',         'Run system health check'],
+        ['resume',         'Resume a previous session'],
+        ['export',         'Export session as markdown or JSON'],
+        ['add-dir',        'Add a working directory'],
+        ['tasks',          'View background tasks'],
+        ['todos',          'View current todo list'],
+        ['plugin',         'Manage plugins (list/install/enable/disable)'],
+        ['agents',         'Browse and create agents'],
+        ['tools',          'Manage tool modes (always/ask/auto/off)'],
+        ['vim',            'Toggle vim keybindings'],
+        ['terminal-setup', 'Configure shell integration'],
+        ['bug',            'Report a bug'],
+        ['version',        'Show version information'],
+        ['quit',           'Exit OpenClaude'],
+      ]
+
+      const maxCmd = Math.max(...commandHelp.map(([c]) => c.length))
+      const cmdLines = commandHelp.map(([cmd, desc]) =>
+        `  /${cmd.padEnd(maxCmd + 1)} ${desc}`
+      ).join('\n')
+
+      return `OpenClaude Help
+${'─'.repeat(56)}
+
+Commands:
+${cmdLines}
+
+Keyboard shortcuts:
+  Shift+Tab  Cycle permission modes
+  Tab        Toggle extended thinking (when input empty)
+  Esc        Cancel current input / Undo
+  Ctrl+C     Exit (or clear input)
+
+Get started:
+  Ask Claude questions about your codebase
+  Use @filename to reference files
+  Use ! prefix for bash commands`
+    }
+  },
+  {
+    name: 'quit',
+    aliases: ['exit', 'q'],
+    description: 'Exit OpenClaude',
+    isEnabled: true,
+    userFacingName() { return 'quit' },
+    async call() {
+      process.exit(0)
+    }
+  },
+  {
+    name: 'version',
+    aliases: ['v'],
+    description: 'Show version information',
+    isEnabled: true,
+    userFacingName() { return 'version' },
+    async call() {
+      return `OpenClaude v${VERSION || '1.0.0'}`
+    }
+  },
+  // Overlay wrappers — these show interactive TUI overlays when called without args,
+  // but fall through to the localCommand handler when args are provided.
+  {
+    name: 'model-overlay',
+    aliases: ['m'],
+    description: 'Switch AI models (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true, // Hidden — /model from localCommands is the user-facing entry
+    userFacingName() { return 'model' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]
+      if (!arg && context?.showModelSelector) {
+        context.showModelSelector()
+        return null
+      }
+      // Has args — delegate to localCommand handler (won't reach here due to merge order)
+      return null
+    }
+  },
+  {
+    name: 'login-overlay',
+    description: 'Sign in to Claude (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'login' },
+    async call(closeOverlay, context) {
+      const authInfo = getAuthInfo()
+      if (authInfo.authenticated && authInfo.method === 'oauth') {
+        return '✓ Already authenticated via OAuth\nUse /logout to sign out'
+      }
+      if (authInfo.authenticated && authInfo.method === 'api_key') {
+        return '✓ Already authenticated via API key (ANTHROPIC_API_KEY)\nOAuth not required when using API key'
+      }
+      if (context?.showAuthSelector) {
+        context.showAuthSelector()
+        return null
+      }
+      return 'Use arrow keys to select auth method, Enter to confirm, Esc to cancel'
+    }
+  },
+  {
+    name: 'fast-overlay',
+    description: 'Toggle fast mode (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'fast' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (arg === 'on' || arg === 'off') {
+        const enable = arg === 'on'
+        setFastMode(enable)
+        return enable
+          ? `↯ Fast mode ON · model set to ${getFastModeDisplayName()}`
+          : 'Fast mode OFF'
+      }
+      if (context?.showFastModeToggle) {
+        context.showFastModeToggle()
+        return null
+      }
+      const current = isFastMode()
+      setFastMode(!current)
+      return !current
+        ? `↯ Fast mode ON · model set to ${getFastModeDisplayName()}`
+        : 'Fast mode OFF'
+    }
+  },
+  {
+    name: 'mcp-overlay',
+    description: 'Manage MCP servers (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'mcp' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (!arg && context?.showMcpManager) {
+        context.showMcpManager()
+        return null
+      }
+      return null // Fall through to localCommand
+    }
+  },
+  {
+    name: 'config-overlay',
+    description: 'Manage configuration (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'config' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (!arg || arg === 'list') {
+        if (context?.showConfigManager) {
+          context.showConfigManager()
+          return null
+        }
+      }
+      return null
+    }
+  },
+  {
+    name: 'approved-tools-overlay',
+    description: 'Manage tool permissions (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'approved-tools' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (!arg || arg === 'list') {
+        if (context?.showApprovedToolsManager) {
+          context.showApprovedToolsManager()
+          return null
+        }
+      }
+      return null
+    }
+  },
+  {
+    name: 'resume-overlay',
+    description: 'Resume a previous session (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'resume' },
+    async call(closeOverlay, context) {
+      if (context?.showSessionPicker) {
+        context.showSessionPicker()
+        return null
+      }
+      return 'Session picker not available in this mode'
+    }
+  },
+  {
+    name: 'plugin-overlay',
+    description: 'Manage plugins (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'plugin' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (!arg && context?.showPluginManager) {
+        context.showPluginManager()
+        return null
+      }
+      return null // Fall through to localCommand
+    }
+  },
+  {
+    name: 'agents-overlay',
+    description: 'Browse and create agents (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'agents' },
+    async call(closeOverlay, context) {
+      if (context?.showAgentManager) {
+        context.showAgentManager()
+        return null
+      }
+      return null
+    }
+  },
+  {
+    name: 'tools-overlay',
+    description: 'Manage tool modes (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'tools' },
+    async call(closeOverlay, context) {
+      if (context?.showToolsManager) {
+        context.showToolsManager()
+        return null
+      }
+      return null
+    }
+  },
+  {
+    name: 'context-overlay',
+    description: 'Manage context items (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'context' },
+    async call(closeOverlay, context) {
+      const arg = context?.args?.[0]?.toLowerCase()
+      if (arg === 'manage' && context?.showContextManager) {
+        context.showContextManager()
+        return null
+      }
+      return null // Fall through to localCommand for /context (no args)
+    }
+  },
+  {
+    name: 'steer-overlay',
+    description: 'Ask steering questions (interactive)',
+    isEnabled: true,
+    isOverlay: true,
+    isHidden: true,
+    userFacingName() { return 'steer' },
+    async call(closeOverlay, context) {
+      if (context?.showSteeringQuestions) {
+        // Demo questions if called manually with no data
+        const demoQuestions = [
+          {
+            id: 'framework',
+            header: 'Framework',
+            question: 'Which UI framework should we use for the new dashboard?',
+            multiSelect: false,
+            options: [
+              { label: 'React + Tailwind (Recommended)', description: 'Matches existing stack, fastest to ship' },
+              { label: 'Vue + Vuetify', description: 'Alternative SPA framework with material components' },
+              { label: 'Svelte + Skeleton', description: 'Lightweight, compiled approach with less boilerplate' },
+              { label: 'Plain HTML + HTMX', description: 'Server-rendered, minimal JS, hypermedia-driven' },
+            ],
+          },
+          {
+            id: 'features',
+            header: 'Features',
+            question: 'Which features should we prioritize for v1?',
+            multiSelect: true,
+            options: [
+              { label: 'Auth + Roles', description: 'User login, SSO, role-based access control' },
+              { label: 'Real-time updates', description: 'WebSocket-based live data feeds' },
+              { label: 'Export/Reports', description: 'PDF/CSV export, scheduled reports' },
+              { label: 'Dark mode', description: 'Theme toggle with system preference detection' },
+            ],
+          },
+          {
+            id: 'api',
+            header: 'API design',
+            question: 'How should we handle the API layer?',
+            multiSelect: false,
+            options: [
+              { label: 'REST + OpenAPI', description: 'Standard REST endpoints with generated docs' },
+              { label: 'GraphQL', description: 'Flexible queries, single endpoint, type-safe' },
+              { label: 'tRPC', description: 'End-to-end type safety, no code generation needed' },
+            ],
+          },
+          {
+            id: 'deploy',
+            header: 'Deploy',
+            question: 'Where should we deploy?',
+            multiSelect: false,
+            options: [
+              { label: 'Vercel', description: 'Zero-config, great DX, automatic previews' },
+              { label: 'Fly.io', description: 'Edge deployment, Docker-based, more control' },
+              { label: 'Self-hosted', description: 'Full control, no vendor lock-in, more ops work' },
+            ],
+          },
+        ]
+        context.showSteeringQuestions(context?.steeringData || demoQuestions)
+        return null
+      }
+      return null
+    }
+  }
+]
+
+// Theme colors
+const THEME = {
+  claude: '#D97706',
+  text: '#E5E5E5',
+  secondaryText: '#6B7280',
+  secondaryBorder: '#374151',
+  success: '#22C55E',
+  error: '#EF4444',
+  warning: '#F59E0B',
+  suggestion: '#3B82F6',
+  bashBorder: '#D4749D',
+}
+
+// Status modes for Shift+Tab cycling
+const STATUS_MODES = {
+  ACCEPT_EDITS: 'acceptEdits',
+  PLAN: 'plan',
+  BYPASS_PERMISSIONS: 'bypassPermissions',
+}
+
+function getNextMode(current) {
+  const modes = Object.values(STATUS_MODES)
+  const idx = modes.indexOf(current)
+  return modes[(idx + 1) % modes.length]
+}
+
+function getModeDisplay(mode) {
+  switch (mode) {
+    case STATUS_MODES.ACCEPT_EDITS:
+      return { icon: '✓', label: 'Auto-accept edits', color: THEME.success }
+    case STATUS_MODES.PLAN:
+      return { icon: '📋', label: 'Plan mode', color: THEME.suggestion }
+    case STATUS_MODES.BYPASS_PERMISSIONS:
+      return { icon: '⚠️', label: 'Bypass permissions', color: THEME.warning }
+    default:
+      return { icon: '?', label: 'Unknown', color: THEME.secondaryText }
+  }
+}
+
+/**
+ * Get git diff stats (files changed, insertions, deletions)
+ * Returns null if not in a git repo or no changes
+ */
+function getGitStats() {
+  try {
+    const output = execFileSync('git', ['diff', '--shortstat'], { encoding: 'utf8', timeout: 2000 }).trim()
+    if (!output) return null
+    const files = output.match(/(\d+) files? changed/)
+    const ins = output.match(/(\d+) insertions?/)
+    const del = output.match(/(\d+) deletions?/)
+    return {
+      files: files ? parseInt(files[1]) : 0,
+      insertions: ins ? parseInt(ins[1]) : 0,
+      deletions: del ? parseInt(del[1]) : 0,
+    }
+  } catch {
+    return null
+  }
+}
+
+// Double-press to exit handler
+function useDoublePress(onDouble, timeout = 2000) {
+  const lastPress = useRef(0)
+  const timeoutRef = useRef(null)
+  const [pending, setPending] = useState(false)
+  const [keyName, setKeyName] = useState('')
+
+  const trigger = useCallback((key = 'Escape') => {
+    const now = Date.now()
+    if (now - lastPress.current < timeout) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current)
+      setPending(false)
+      onDouble()
+    } else {
+      setPending(true)
+      setKeyName(key)
+      timeoutRef.current = setTimeout(() => setPending(false), timeout)
+    }
+    lastPress.current = now
+  }, [onDouble, timeout])
+
+  return { trigger, pending, keyName }
+}
+
+/**
+ * Welcome Banner
+ */
+function WelcomeBanner({ mcpClients = [], isDefaultModel = true }) {
+  const width = Math.max(46, process.cwd().length + 12)
+
+  return React.createElement(Box, { flexDirection: 'column' },
+    React.createElement(Box, {
+      borderColor: THEME.claude,
+      borderStyle: 'round',
+      flexDirection: 'column',
+      gap: 1,
+      paddingLeft: 1,
+      width: width
+    },
+      React.createElement(Text, { key: 'title' },
+        React.createElement(Text, { color: THEME.claude }, '✻'),
+        ' Welcome to ',
+        React.createElement(Text, { bold: true }, 'Open Claude Code'),
+        React.createElement(Text, null, '!')
+      ),
+      React.createElement(Box, {
+        key: 'info',
+        paddingLeft: 2,
+        flexDirection: 'column',
+        gap: 1
+      },
+        React.createElement(Text, { key: 'help', color: THEME.secondaryText, italic: true }, '/help for help'),
+        React.createElement(Text, { key: 'cwd', color: THEME.secondaryText }, 'cwd: ', process.cwd())
+      ),
+      mcpClients.length > 0 && React.createElement(Box, {
+        key: 'mcp',
+        borderColor: THEME.secondaryBorder,
+        borderStyle: 'single',
+        borderBottom: false,
+        borderLeft: false,
+        borderRight: false,
+        borderTop: true,
+        flexDirection: 'column',
+        marginLeft: 2,
+        marginRight: 1,
+        paddingTop: 1
+      },
+        React.createElement(Box, { key: 'mcp-title', marginBottom: 1 },
+          React.createElement(Text, { color: THEME.secondaryText }, 'MCP Servers:')
+        ),
+        mcpClients.map((client, idx) =>
+          React.createElement(Box, { key: idx, width: width - 6 },
+            React.createElement(Text, { color: THEME.secondaryText }, '• ', client.name),
+            React.createElement(Box, { flexGrow: 1 }),
+            React.createElement(Text, {
+              bold: true,
+              color: client.type === 'connected' ? THEME.success : THEME.error
+            }, client.type === 'connected' ? 'connected' : 'failed')
+          )
+        )
+      )
+    )
+  )
+}
+
+/**
+ * Workspace Tips
+ */
+function WorkspaceTips({ workspaceDir }) {
+  const config = loadConfig()
+  const hasCompletedOnboarding = config.hasCompletedProjectOnboarding
+
+  if (hasCompletedOnboarding) return null
+
+  return React.createElement(Box, {
+    flexDirection: 'column',
+    gap: 1,
+    padding: 1,
+    paddingBottom: 0
+  },
+    React.createElement(Text, { key: 'title', color: THEME.secondaryText }, 'Tips for getting started:'),
+    React.createElement(Box, { key: 'tips', flexDirection: 'column', paddingLeft: 2 },
+      React.createElement(Text, { key: 'tip1', color: THEME.secondaryText },
+        '• Run ', React.createElement(Text, { color: THEME.text }, '/init'),
+        ' to create a CLAUDE.md file with instructions for Claude.'
+      ),
+      React.createElement(Text, { key: 'tip2', color: THEME.secondaryText },
+        '• Ask Claude questions about your codebase.'
+      ),
+      React.createElement(Text, { key: 'tip3', color: THEME.secondaryText },
+        '• Ask Claude to implement changes to your codebase.'
+      )
+    )
+  )
+}
+
+/**
+ * Loading Spinner
+ */
+function LoadingSpinner() {
+  const [frame, setFrame] = useState(0)
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setFrame(f => (f + 1) % frames.length)
+    }, 80)
+    return () => clearInterval(timer)
+  }, [])
+
+  return React.createElement(Box, { marginLeft: 3 },
+    React.createElement(Text, { color: THEME.claude }, frames[frame], ' Thinking...')
+  )
+}
+
+/**
+ * Token Counter Display
+ */
+function TokenCounter({ tokenUsage }) {
+  if (!tokenUsage || tokenUsage === 0) return null
+
+  const formatted = tokenUsage >= 1000
+    ? `${(tokenUsage / 1000).toFixed(1)}k`
+    : tokenUsage.toString()
+
+  return React.createElement(Text, { dimColor: true }, formatted, ' tokens')
+}
+
+/**
+ * Text Input Display - just renders, doesn't handle input
+ * Input handling is done by parent PromptInput
+ */
+function TextInputDisplay({
+  value,
+  placeholder = '',
+  isDimmed = false,
+  cursorOffset = 0,
+  color,
+}) {
+  // Render with cursor
+  const displayValue = value || ''
+  const cursorPos = Math.min(cursorOffset, displayValue.length)
+  const beforeCursor = displayValue.slice(0, cursorPos)
+  const atCursor = displayValue[cursorPos] || ' '
+  const afterCursor = displayValue.slice(cursorPos + 1)
+
+  if (!value && placeholder) {
+    return React.createElement(Text, { color: THEME.secondaryText },
+      React.createElement(Text, { inverse: true }, placeholder[0] || ' '),
+      placeholder.slice(1)
+    )
+  }
+
+  return React.createElement(Text, { dimColor: isDimmed, color, wrap: 'truncate-end' },
+    beforeCursor,
+    React.createElement(Text, { inverse: true, color }, atCursor),
+    afterCursor
+  )
+}
+
+/**
+ * Message Renderer
+ */
+function MessageRenderer({
+  message,
+  messages,
+  tools,
+  verbose,
+  debug,
+  addMargin = true,
+  erroredToolUseIDs = new Set(),
+  inProgressToolUseIDs = new Set(),
+  unresolvedToolUseIDs = new Set(),
+  shouldAnimate = false,
+  shouldShowDot = true,
+}) {
+  const messageId = message.uuid || message.id || 'unknown'
+
+  if (message.type === 'assistant') {
+    // Handle string content (from commands) or array content (from AI)
+    const assistantContent = typeof message.message.content === 'string'
+      ? [{ type: 'text', text: message.message.content }]
+      : message.message.content
+
+    return React.createElement(Box, { flexDirection: 'column', width: '100%' },
+      assistantContent.map((item, idx) =>
+        React.createElement(AssistantContentRenderer, {
+          key: item.id || `${messageId}-${item.type}-${idx}`,
+          param: item,
+          tools,
+          verbose,
+          debug,
+          addMargin,
+          erroredToolUseIDs,
+          inProgressToolUseIDs,
+          unresolvedToolUseIDs,
+          shouldAnimate,
+          shouldShowDot,
+        })
+      )
+    )
+  }
+
+  // User message
+  const content = typeof message.message.content === 'string'
+    ? [{ type: 'text', text: message.message.content }]
+    : message.message.content
+
+  return React.createElement(Box, { flexDirection: 'column', width: '100%' },
+    content.map((item, idx) =>
+      React.createElement(UserContentRenderer, {
+        key: item.tool_use_id || `${messageId}-${item.type}-${idx}`,
+        param: item,
+        message,
+        messages,
+        tools,
+        verbose,
+        addMargin,
+      })
+    )
+  )
+}
+
+/**
+ * Assistant Content Renderer
+ */
+function AssistantContentRenderer({
+  param,
+  tools,
+  verbose,
+  debug,
+  addMargin,
+  erroredToolUseIDs,
+  inProgressToolUseIDs,
+  unresolvedToolUseIDs,
+  shouldAnimate,
+  shouldShowDot,
+}) {
+  switch (param.type) {
+    case 'tool_use':
+      return React.createElement(ToolUseRenderer, {
+        param,
+        tools,
+        verbose,
+        debug,
+        addMargin,
+        erroredToolUseIDs,
+        inProgressToolUseIDs,
+        unresolvedToolUseIDs,
+        shouldAnimate,
+        shouldShowDot,
+      })
+
+    case 'text':
+      return React.createElement(Box, {
+        flexDirection: 'column',
+        marginTop: addMargin ? 1 : 0,
+        marginLeft: 2
+      },
+        React.createElement(Text, null,
+          shouldShowDot && React.createElement(Text, { color: THEME.claude }, '⏺ '),
+          param.text
+        )
+      )
+
+    case 'thinking':
+      return React.createElement(Box, {
+        marginTop: addMargin ? 1 : 0,
+        marginLeft: 2
+      },
+        React.createElement(Text, { dimColor: true, italic: true },
+          '[Thinking: ', param.thinking?.substring(0, 100) || '', '...]'
+        )
+      )
+
+    case 'redacted_thinking':
+      return React.createElement(Box, {
+        marginTop: addMargin ? 1 : 0,
+        marginLeft: 2
+      },
+        React.createElement(Text, { dimColor: true, italic: true },
+          '[Thinking redacted for safety]'
+        )
+      )
+
+    default:
+      return null
+  }
+}
+
+/**
+ * User Content Renderer
+ */
+function UserContentRenderer({ param, message, messages, tools, verbose, addMargin }) {
+  switch (param.type) {
+    case 'text':
+      return React.createElement(Box, {
+        marginTop: addMargin ? 1 : 0,
+        marginLeft: 2
+      },
+        React.createElement(Text, { color: THEME.success, bold: true }, '> '),
+        React.createElement(Text, null, param.text)
+      )
+
+    case 'image':
+      return React.createElement(Box, {
+        marginTop: addMargin ? 1 : 0,
+        marginLeft: 2
+      },
+        React.createElement(Text, { color: '#FF9500' },
+          `📎 [image: ${param.source?.media_type || 'image'}]`
+        )
+      )
+
+    case 'tool_result':
+      const isError = param.is_error
+      const content = typeof param.content === 'string'
+        ? param.content
+        : JSON.stringify(param.content)
+
+      return React.createElement(Box, {
+        flexDirection: 'column',
+        marginLeft: 4
+      },
+        React.createElement(Text, { color: isError ? THEME.error : THEME.secondaryText },
+          isError ? '✗ Error: ' : '⎿ ',
+          content.substring(0, 500),
+          content.length > 500 ? '...' : ''
+        )
+      )
+
+    default:
+      return null
+  }
+}
+
+/**
+ * Tool Use Renderer
+ */
+function ToolUseRenderer({
+  param,
+  tools,
+  verbose,
+  addMargin,
+  erroredToolUseIDs,
+  inProgressToolUseIDs,
+  unresolvedToolUseIDs,
+  shouldAnimate,
+  shouldShowDot,
+}) {
+  // Skip synthetic tool_use messages created by normalizeMessages
+  if (param.name === 'unknown') {
+    return null
+  }
+
+  const tool = tools?.find(t => t.name === param.name)
+  const toolName = tool?.userFacingName?.() || param.name
+
+  const isErrored = erroredToolUseIDs.has(param.id)
+  const isInProgress = inProgressToolUseIDs.has(param.id)
+  const isUnresolved = unresolvedToolUseIDs.has(param.id)
+
+  let statusIcon = '⏺'
+  let statusColor = THEME.claude
+
+  if (isErrored) {
+    statusIcon = '✗'
+    statusColor = THEME.error
+  } else if (isInProgress) {
+    statusIcon = '◐'
+    statusColor = THEME.suggestion
+  } else if (!isUnresolved) {
+    statusIcon = '✓'
+    statusColor = THEME.success
+  }
+
+  return React.createElement(Box, {
+    flexDirection: 'column',
+    marginTop: addMargin ? 1 : 0,
+    marginLeft: 2
+  },
+    React.createElement(Text, null,
+      shouldShowDot && React.createElement(Text, { color: statusColor }, statusIcon, ' '),
+      React.createElement(Text, { bold: true, color: THEME.suggestion }, toolName)
+    ),
+    verbose && param.input && React.createElement(Box, { marginLeft: 2 },
+      React.createElement(Text, { dimColor: true },
+        JSON.stringify(param.input, null, 2).substring(0, 200)
+      )
+    )
+  )
+}
+
+/**
+ * Prompt Input - main input component with all features
+ */
+function PromptInput({
+  commands = [],
+  tools = [],
+  isDisabled = false,
+  isLoading = false,
+  onQuery,
+  debug = false,
+  verbose = false,
+  messages = [],
+  mode,
+  onModeChange,
+  onShowMessageSelector,
+  onCancel,
+  mcpStatus = null,
+  gitStats = null,
+  onBypassPermissionsChange,
+}) {
+  // Internal input state (moved from parent to avoid re-renders)
+  const [input, setInput] = useState('')
+  const onInputChange = setInput
+
+  // Status line state
+  const [statusMode, setStatusMode] = useState(STATUS_MODES.ACCEPT_EDITS)
+  const [thinkingEnabled, setThinkingEnabled] = useState(false)
+  const [thinkingVisible, setThinkingVisible] = useState(false)
+  const thinkingTimeoutRef = useRef(null)
+
+  // Suggestions state
+  const [suggestions, setSuggestions] = useState([])
+  const [selectedSuggestion, setSelectedSuggestion] = useState(0)
+  const [suggestionMode, setSuggestionMode] = useState(null)
+
+  // Refs to avoid stale closure issues with rapid input
+  const inputRef = useRef(input)
+  const cursorOffsetRef = useRef(input.length)
+  const [cursorOffset, _setCursorOffset] = useState(input.length)
+
+  // Keep inputRef in sync with prop
+  useEffect(() => {
+    inputRef.current = input
+  }, [input])
+
+  const setCursorOffset = useCallback((val) => {
+    const newVal = typeof val === 'function' ? val(cursorOffsetRef.current) : val
+    cursorOffsetRef.current = newVal
+    _setCursorOffset(newVal)
+  }, [])
+
+  const [exitMessage, setExitMessage] = useState({ show: false })
+
+  // History
+  const [history, setHistory] = useState([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+
+  // Image attachments
+  const [attachments, setAttachments] = useState([])  // Array of { path, name }
+  const [attachmentFocusIndex, setAttachmentFocusIndex] = useState(-1) // -1 = input focused, 0+ = attachment index
+
+  // Double press to exit
+  const exitHandler = useDoublePress(() => process.exit(0))
+
+  // Status line handlers
+  const handleStatusShiftTab = useCallback(() => {
+    setStatusMode(prev => {
+      const next = getNextMode(prev)
+      onBypassPermissionsChange?.(next === STATUS_MODES.BYPASS_PERMISSIONS)
+      return next
+    })
+  }, [onBypassPermissionsChange])
+
+  const handleStatusTab = useCallback(() => {
+    setThinkingEnabled(prev => !prev)
+    setThinkingVisible(true)
+    if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current)
+    thinkingTimeoutRef.current = setTimeout(() => {
+      setThinkingVisible(false)
+    }, 3000)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current)
+    }
+  }, [])
+
+  // Update suggestions based on input
+  useEffect(() => {
+    // DEBUG: Log commands and input
+    if (process.env.DEBUG_TUI) {
+      console.error('[DEBUG] input:', JSON.stringify(input), 'commands:', commands.length)
+    }
+
+    if (input.startsWith('/')) {
+      // Command suggestions
+      const search = input.slice(1).toLowerCase()
+      const matching = commands
+        .filter(cmd => {
+          const name = cmd.userFacingName?.() || cmd.name
+          return name.toLowerCase().includes(search) ||
+            cmd.aliases?.some(a => a.toLowerCase().includes(search))
+        })
+        .map(cmd => cmd.userFacingName?.() || cmd.name)
+        .slice(0, MAX_SUGGESTIONS)
+
+      if (process.env.DEBUG_TUI) {
+        console.error('[DEBUG] suggestions:', matching)
+      }
+
+      setSuggestions(matching)
+      setSelectedSuggestion(0)
+      setSuggestionMode('command')
+    } else if (input.includes('@') && !input.startsWith('/')) {
+      // File suggestions
+      const atIndex = input.lastIndexOf('@')
+      const search = input.slice(atIndex + 1).split(' ')[0]
+      if (search.length > 0) {
+        // Search for files matching the pattern
+        const searchFiles = async () => {
+          try {
+            const pattern = `**/*${search}*`
+            const files = await glob(pattern, {
+              cwd: process.cwd(),
+              nodir: true,
+              ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+              maxDepth: 5
+            })
+            const matches = files
+              .slice(0, MAX_SUGGESTIONS)
+              .map(f => relative(process.cwd(), f) || f)
+            setSuggestions(matches)
+            setSuggestionMode('file')
+          } catch (e) {
+            setSuggestions([])
+            setSuggestionMode(null)
+          }
+        }
+        searchFiles()
+      } else {
+        // Show recent/common files when @ is typed without search
+        setSuggestions([])
+        setSuggestionMode('file')
+      }
+    } else {
+      setSuggestions([])
+      setSuggestionMode(null)
+    }
+  }, [input, commands])
+
+  // Auto-detect image file paths in input (fires on every input change)
+  // Handles drag-drop (terminal emits path as text) and manual paste
+  useEffect(() => {
+    if (!input) return
+    const IMAGE_PATH_RE = /(?:['"]?)((?:\/|~\/|\.\/)[^\s'"]*\.(?:png|jpg|jpeg|gif|bmp|webp))(?:['"]?)/gi
+    const matches = [...input.matchAll(IMAGE_PATH_RE)]
+    if (matches.length === 0) return
+
+    let remaining = input
+    let foundAny = false
+    for (const match of matches) {
+      const pathCandidate = match[1]
+      const resolvedPath = pathCandidate.startsWith('~')
+        ? pathCandidate.replace('~', homedir())
+        : pathCandidate
+      if (existsSync(resolvedPath)) {
+        setAttachments(prev => {
+          if (prev.some(a => a.path === resolvedPath)) return prev
+          return [...prev, { path: resolvedPath, name: basename(resolvedPath) }]
+        })
+        remaining = remaining.replace(match[0], '').trim()
+        foundAny = true
+      }
+    }
+
+    if (foundAny) {
+      setAttachmentFocusIndex(-1)
+      onInputChange(remaining)
+      inputRef.current = remaining
+      setCursorOffset(remaining.length)
+    }
+  }, [input])
+
+  // Handle submit
+  const handleSubmit = useCallback(async (value) => {
+    const hasAttachments = attachments.length > 0
+    // Robust input validation — allow empty text if attachments exist
+    if (!hasAttachments && (!value || typeof value !== 'string' || value.trim() === '')) return
+    if (isDisabled || isLoading) return
+
+    // Sanitize and validate input length (max 100k chars)
+    const sanitizedValue = (value || '').trim().slice(0, 100000)
+    if (!hasAttachments && sanitizedValue.length === 0) return
+
+    // Handle exit commands
+    if (['exit', 'quit', ':q', ':q!', ':wq', ':wq!'].includes(sanitizedValue)) {
+      process.exit(0)
+    }
+
+    // Clear input and attachments immediately to prevent double submission
+    onInputChange('')
+    setCursorOffset(0)
+    setSuggestions([])
+    const currentAttachments = [...attachments]
+    setAttachments([])
+    setAttachmentFocusIndex(-1)
+
+    // Add to history (text only)
+    if (sanitizedValue) {
+      setHistory(h => [sanitizedValue, ...h.slice(0, 50)])
+    }
+    setHistoryIndex(-1)
+
+    // Call onQuery with error handling
+    try {
+      if (typeof onQuery === 'function') {
+        if (currentAttachments.length > 0) {
+          // Send as object with attachments for multipart content
+          await onQuery({ text: sanitizedValue, attachments: currentAttachments })
+        } else {
+          await onQuery(sanitizedValue)
+        }
+      }
+    } catch (error) {
+      console.error('[TUI] Error in onQuery:', error)
+    }
+  }, [isDisabled, isLoading, onInputChange, onQuery, setCursorOffset, setSuggestions, setHistory, setHistoryIndex, attachments])
+
+  // Handle history navigation
+  const handleHistoryUp = useCallback(() => {
+    if (history.length === 0) return
+    const newIndex = Math.min(historyIndex + 1, history.length - 1)
+    setHistoryIndex(newIndex)
+    const historyValue = history[newIndex] || ''
+    inputRef.current = historyValue
+    onInputChange(historyValue)
+    setCursorOffset(historyValue.length)
+  }, [history, historyIndex, onInputChange])
+
+  const handleHistoryDown = useCallback(() => {
+    if (historyIndex <= 0) {
+      setHistoryIndex(-1)
+      inputRef.current = ''
+      onInputChange('')
+      setCursorOffset(0)
+      return
+    }
+    const newIndex = historyIndex - 1
+    setHistoryIndex(newIndex)
+    const historyValue = history[newIndex] || ''
+    inputRef.current = historyValue
+    onInputChange(historyValue)
+    setCursorOffset(historyValue.length)
+  }, [history, historyIndex, onInputChange])
+
+  // ALL keyboard input handled here
+  useInput((char, key) => {
+    // Robust null checking
+    if (!key || typeof key !== 'object') return
+
+    // Handle Escape - cancel loading OR clear input
+    if (key.escape) {
+      if (isLoading && onCancel) {
+        onCancel()
+        return
+      }
+      if (input === '' && messages.length > 0 && !isLoading) {
+        onShowMessageSelector?.()
+      } else if (input === '') {
+        exitHandler.trigger('Escape')
+      } else {
+        onInputChange('')
+        setCursorOffset(0)
+        onModeChange?.('prompt')
+      }
+      return
+    }
+
+    // Shift+Tab to cycle modes
+    if (key.shift && key.tab) {
+      handleStatusShiftTab()
+      return
+    }
+
+    // Tab to toggle thinking (when input is empty) or autocomplete suggestion
+    if (key.tab && !key.shift) {
+      if (suggestions.length > 0 && suggestionMode) {
+        // Autocomplete the selected suggestion
+        const selected = suggestions[selectedSuggestion]
+        if (selected) {
+          const currentInput = inputRef.current
+          if (suggestionMode === 'command') {
+            // Replace entire input with command
+            const newValue = '/' + selected + ' '
+            inputRef.current = newValue
+            onInputChange(newValue)
+            setCursorOffset(newValue.length)
+          } else if (suggestionMode === 'file') {
+            // Replace @search with @file
+            const atIndex = currentInput.lastIndexOf('@')
+            const beforeAt = currentInput.slice(0, atIndex)
+            const newValue = beforeAt + '@' + selected + ' '
+            inputRef.current = newValue
+            onInputChange(newValue)
+            setCursorOffset(newValue.length)
+          }
+          setSuggestions([])
+          setSuggestionMode(null)
+        }
+        return
+      }
+      if (input === '' && !isLoading) {
+        handleStatusTab()
+      }
+      return
+    }
+
+    // Enter to submit (or autocomplete+submit if suggestion is active)
+    if (key.return && !key.shift) {
+      if (suggestions.length > 0 && suggestionMode) {
+        const selected = suggestions[selectedSuggestion]
+        if (selected) {
+          if (suggestionMode === 'command') {
+            // Submit the command directly
+            const cmdValue = '/' + selected
+            setSuggestions([])
+            setSuggestionMode(null)
+            handleSubmit(cmdValue)
+            return
+          } else if (suggestionMode === 'file') {
+            // Autocomplete file and submit
+            const currentInput = inputRef.current
+            const atIndex = currentInput.lastIndexOf('@')
+            const beforeAt = currentInput.slice(0, atIndex)
+            const finalValue = beforeAt + '@' + selected
+            setSuggestions([])
+            setSuggestionMode(null)
+            handleSubmit(finalValue)
+            return
+          }
+        }
+      }
+      handleSubmit(input)
+      return
+    }
+
+    // Shift+Enter for newline
+    if (key.return && key.shift) {
+      const offset = cursorOffsetRef.current
+      const currentInput = inputRef.current
+      const newValue = currentInput.slice(0, offset) + '\n' + currentInput.slice(offset)
+      inputRef.current = newValue
+      onInputChange(newValue)
+      setCursorOffset(offset + 1)
+      return
+    }
+
+    // Navigate suggestions OR attachments OR history
+    if (key.upArrow) {
+      if (suggestions.length > 0) {
+        setSelectedSuggestion(s => Math.max(0, s - 1))
+      } else if (attachmentFocusIndex === -1 && attachments.length > 0) {
+        // From input → focus last attachment
+        setAttachmentFocusIndex(attachments.length - 1)
+      } else if (attachmentFocusIndex > 0) {
+        // Navigate up through attachments
+        setAttachmentFocusIndex(i => i - 1)
+      } else if (attachmentFocusIndex === 0) {
+        // Past all attachments → go to history
+        setAttachmentFocusIndex(-1)
+        handleHistoryUp()
+      } else {
+        handleHistoryUp()
+      }
+      return
+    }
+    if (key.downArrow) {
+      if (suggestions.length > 0) {
+        setSelectedSuggestion(s => Math.min(suggestions.length - 1, s + 1))
+      } else if (attachmentFocusIndex >= 0) {
+        // Navigate down through attachments → back to input
+        if (attachmentFocusIndex < attachments.length - 1) {
+          setAttachmentFocusIndex(i => i + 1)
+        } else {
+          setAttachmentFocusIndex(-1)
+        }
+      } else {
+        handleHistoryDown()
+      }
+      return
+    }
+
+    // Cursor movement
+    if (key.leftArrow) {
+      setCursorOffset(o => Math.max(0, o - 1))
+      return
+    }
+    if (key.rightArrow) {
+      setCursorOffset(o => Math.min(input.length, o + 1))
+      return
+    }
+
+    // Backspace — remove attachment if one is focused
+    if (key.backspace || key.delete) {
+      if (attachmentFocusIndex >= 0) {
+        setAttachments(prev => prev.filter((_, i) => i !== attachmentFocusIndex))
+        setAttachmentFocusIndex(i => {
+          const newLen = attachments.length - 1
+          if (newLen === 0) return -1
+          return Math.min(i, newLen - 1)
+        })
+        return
+      }
+      const offset = cursorOffsetRef.current
+      const currentInput = inputRef.current
+      if (offset > 0) {
+        const newValue = currentInput.slice(0, offset - 1) + currentInput.slice(offset)
+        inputRef.current = newValue
+        onInputChange(newValue)
+        setCursorOffset(offset - 1)
+      }
+      return
+    }
+
+    // Ctrl+A - start of line
+    if (key.ctrl && char === 'a') {
+      setCursorOffset(0)
+      return
+    }
+
+    // Ctrl+E - end of line
+    if (key.ctrl && char === 'e') {
+      setCursorOffset(input.length)
+      return
+    }
+
+    // Ctrl+U - clear line
+    if (key.ctrl && char === 'u') {
+      onInputChange('')
+      setCursorOffset(0)
+      return
+    }
+
+    // Ctrl+C - exit if empty, clear if has text
+    if (key.ctrl && char === 'c') {
+      if (input === '') {
+        process.exit(0)
+      } else {
+        onInputChange('')
+        setCursorOffset(0)
+      }
+      return
+    }
+
+    // Ctrl+K - kill to end of line
+    if (key.ctrl && char === 'k') {
+      const offset = cursorOffsetRef.current
+      const currentInput = inputRef.current || ''
+      const newValue = currentInput.slice(0, offset)
+      inputRef.current = newValue
+      onInputChange(newValue)
+      return
+    }
+
+    // Ctrl+W - delete word backward
+    if (key.ctrl && char === 'w') {
+      const offset = cursorOffsetRef.current
+      const currentInput = inputRef.current || ''
+      const beforeCursor = currentInput.slice(0, offset)
+      // Find last word boundary
+      const match = beforeCursor.match(/\S+\s*$/)
+      if (match) {
+        const newOffset = offset - match[0].length
+        const newValue = currentInput.slice(0, newOffset) + currentInput.slice(offset)
+        inputRef.current = newValue
+        onInputChange(newValue)
+        setCursorOffset(newOffset)
+      }
+      return
+    }
+
+    // Alt+F - forward word
+    if (key.meta && char === 'f') {
+      const currentInput = inputRef.current || ''
+      const afterCursor = currentInput.slice(cursorOffsetRef.current)
+      const match = afterCursor.match(/^\s*\S+/)
+      if (match) {
+        setCursorOffset(o => o + match[0].length)
+      }
+      return
+    }
+
+    // Alt+B - backward word
+    if (key.meta && char === 'b') {
+      const currentInput = inputRef.current || ''
+      const beforeCursor = currentInput.slice(0, cursorOffsetRef.current)
+      const match = beforeCursor.match(/\S+\s*$/)
+      if (match) {
+        setCursorOffset(o => o - match[0].length)
+      }
+      return
+    }
+
+    // Regular character input
+    if (char && typeof char === 'string' && !key.ctrl && !key.meta) {
+      // Validate character is printable (not control chars)
+      const charCode = char.charCodeAt(0)
+      if (charCode < 32 && charCode !== 10) return // Skip control chars except newline
+
+      // Typing refocuses to input
+      if (attachmentFocusIndex >= 0) setAttachmentFocusIndex(-1)
+
+      const offset = cursorOffsetRef.current
+      const currentInput = inputRef.current || ''
+
+      // Validate offset is within bounds
+      const safeOffset = Math.max(0, Math.min(offset, currentInput.length))
+
+      const newValue = currentInput.slice(0, safeOffset) + char + currentInput.slice(safeOffset)
+      inputRef.current = newValue
+      onInputChange(newValue)
+      setCursorOffset(safeOffset + char.length)
+    }
+  })
+
+
+  const columns = Math.max(40, process.stdout.columns || 80)
+
+  return React.createElement(Box, { flexDirection: 'column' },
+    // Attachment chips (above input)
+    attachments.length > 0 && React.createElement(Box, {
+      key: 'attachments-bar',
+      flexDirection: 'row',
+      marginLeft: 3,
+      marginTop: 1,
+      gap: 1,
+      flexWrap: 'wrap',
+    },
+      ...attachments.map((att, i) => {
+        const focused = attachmentFocusIndex === i
+        return React.createElement(Box, {
+          key: `att-${i}`,
+          borderStyle: 'round',
+          borderColor: focused ? '#FF9500' : '#3B3B3B',
+          paddingX: 1,
+        },
+          React.createElement(Text, {
+            color: focused ? '#FF9500' : '#A0A0A0',
+            bold: focused,
+          }, `📎 ${att.name}`),
+          focused && React.createElement(Text, { dimColor: true }, ' ⌫')
+        )
+      })
+    ),
+    // Input box
+    React.createElement(Box, {
+      key: 'input-box',
+      alignItems: 'flex-start',
+      justifyContent: 'flex-start',
+      borderColor: mode === 'bash' ? THEME.bashBorder : THEME.secondaryBorder,
+      borderDimColor: true,
+      borderStyle: 'round',
+      marginTop: 1,
+    },
+      // Prompt indicator
+      React.createElement(Box, {
+        key: 'prompt',
+        alignItems: 'flex-start',
+        alignSelf: 'flex-start',
+        flexWrap: 'nowrap',
+        justifyContent: 'flex-start',
+        width: 3
+      },
+        mode === 'bash'
+          ? React.createElement(Text, { key: 'bash', color: THEME.bashBorder }, ' ! ')
+          : React.createElement(Text, { key: 'normal', color: isLoading ? THEME.secondaryText : undefined }, ' > ')
+      ),
+      // Text input display
+      React.createElement(Box, { key: 'input', paddingRight: 1, flexGrow: 1 },
+        React.createElement(TextInputDisplay, {
+          value: input,
+          placeholder: 'Ask Claude...',
+          isDimmed: isDisabled || isLoading,
+          cursorOffset: cursorOffset,
+          color: mode === 'bash' ? THEME.bashBorder : undefined,
+        })
+      )
+    ),
+
+    // Status line / hints
+    suggestions.length === 0 && (
+      statusMode === STATUS_MODES.ACCEPT_EDITS
+        // Default mode - show hints
+        ? React.createElement(Box, {
+            key: 'status-hints',
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+            paddingX: 2,
+            paddingY: 0
+          },
+            React.createElement(Box, { key: 'left', justifyContent: 'flex-start', gap: 1 },
+              exitMessage.show
+                ? React.createElement(Text, { key: 'exit', dimColor: true },
+                    'Press ', exitMessage.key, ' again to exit'
+                  )
+                : React.createElement(React.Fragment, { key: 'hints' },
+                    React.createElement(Text, {
+                      key: 'bash',
+                      color: mode === 'bash' ? THEME.bashBorder : undefined,
+                      dimColor: mode !== 'bash'
+                    }, '! for bash mode'),
+                    React.createElement(Text, { key: 'commands', dimColor: true },
+                      ' · / for commands · esc to undo'
+                    )
+                  )
+            ),
+            React.createElement(Box, { key: 'right', justifyContent: 'flex-end', gap: 1 },
+              mcpStatus && React.createElement(React.Fragment, { key: 'mcp' },
+                React.createElement(Text, { dimColor: true }, 'MCP:'),
+                mcpStatus.connected > 0 && React.createElement(Text, { color: THEME.success }, String(mcpStatus.connected)),
+                mcpStatus.total - mcpStatus.connected > 0 && React.createElement(Text, { color: '#6B7280' }, String(mcpStatus.total - mcpStatus.connected))
+              ),
+              mcpStatus && gitStats && React.createElement(Text, { key: 'sep1', dimColor: true }, ' · '),
+              gitStats && React.createElement(React.Fragment, { key: 'git' },
+                React.createElement(Text, { dimColor: true }, `${gitStats.files} files `),
+                gitStats.insertions > 0 && React.createElement(Text, { color: THEME.success }, `+${gitStats.insertions} `),
+                gitStats.deletions > 0 && React.createElement(Text, { color: THEME.error }, `-${gitStats.deletions}`)
+              )
+            )
+          )
+        // Non-default mode - show mode indicator with git stats
+        : React.createElement(Box, {
+            key: 'status-mode',
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+            paddingX: 2,
+            paddingY: 0
+          },
+            React.createElement(Box, { key: 'left', justifyContent: 'flex-start' },
+              React.createElement(Text, { key: 'arrows', color: getModeDisplay(statusMode).color }, '►► '),
+              React.createElement(Text, { key: 'mode', color: getModeDisplay(statusMode).color },
+                getModeDisplay(statusMode).label.toLowerCase(), ' on'
+              ),
+              React.createElement(Text, { key: 'hint', dimColor: true }, ' (shift+tab to cycle)'),
+              gitStats && React.createElement(React.Fragment, { key: 'git' },
+                React.createElement(Text, { dimColor: true }, ' · '),
+                React.createElement(Text, { dimColor: true }, `${gitStats.files} files `),
+                gitStats.insertions > 0 && React.createElement(Text, { color: THEME.success }, `+${gitStats.insertions} `),
+                gitStats.deletions > 0 && React.createElement(Text, { color: THEME.error }, `-${gitStats.deletions}`)
+              ),
+              mcpStatus && React.createElement(React.Fragment, { key: 'mcp' },
+                React.createElement(Text, { dimColor: true }, ' · MCP:'),
+                mcpStatus.connected > 0 && React.createElement(Text, { color: THEME.success }, String(mcpStatus.connected)),
+                mcpStatus.total - mcpStatus.connected > 0 && React.createElement(Text, { color: '#6B7280' }, String(mcpStatus.total - mcpStatus.connected))
+              )
+            )
+          )
+    ),
+
+    // Suggestions (commands or files)
+    suggestions.length > 0 && (() => {
+      // Calculate visible window - show VISIBLE_SUGGESTIONS items at a time
+      const totalSuggestions = suggestions.length
+      const halfWindow = Math.floor(VISIBLE_SUGGESTIONS / 2)
+
+      let startIdx = Math.max(0, selectedSuggestion - halfWindow)
+      let endIdx = Math.min(totalSuggestions, startIdx + VISIBLE_SUGGESTIONS)
+
+      // Adjust if we're at the end
+      if (endIdx - startIdx < VISIBLE_SUGGESTIONS) {
+        startIdx = Math.max(0, endIdx - VISIBLE_SUGGESTIONS)
+      }
+
+      const visibleSuggestions = suggestions.slice(startIdx, endIdx)
+      const hasMore = totalSuggestions > VISIBLE_SUGGESTIONS
+
+      return React.createElement(Box, {
+        key: 'suggestions',
+        flexDirection: 'column',
+        paddingX: 2,
+        paddingY: 0,
+        borderStyle: 'single',
+        borderColor: THEME.secondaryBorder,
+        marginTop: 0
+      },
+        // Header
+        React.createElement(Text, { key: 'header', dimColor: true, bold: true },
+          suggestionMode === 'command' ? 'Commands' : 'Files',
+          hasMore ? ` (${selectedSuggestion + 1}/${totalSuggestions})` : ` (${totalSuggestions})`,
+          ' · ↑↓ select · Tab complete'
+        ),
+        // Suggestions list
+        React.createElement(Box, { key: 'list', flexDirection: 'column', marginTop: 0 },
+          visibleSuggestions.map((suggestion, visIdx) => {
+            const idx = startIdx + visIdx
+            const isSelected = idx === selectedSuggestion
+
+            if (suggestionMode === 'command') {
+              const cmd = commands.find(c => (c.userFacingName?.() || c.name) === suggestion)
+              return React.createElement(Box, {
+                key: `cmd-${idx}`,
+                flexDirection: 'row'
+              },
+                React.createElement(Text, {
+                  color: isSelected ? THEME.suggestion : undefined,
+                  dimColor: !isSelected,
+                  inverse: isSelected
+                }, isSelected ? ' → ' : '   ', '/', suggestion),
+                cmd && React.createElement(Text, {
+                  color: isSelected ? THEME.suggestion : undefined,
+                  dimColor: !isSelected
+                }, '  ', cmd.description || '')
+              )
+            } else {
+              // File suggestion
+              return React.createElement(Box, {
+                key: `file-${idx}`,
+                flexDirection: 'row'
+              },
+                React.createElement(Text, {
+                  color: isSelected ? THEME.success : undefined,
+                  dimColor: !isSelected,
+                  inverse: isSelected
+                }, isSelected ? ' → ' : '   ', '@', suggestion)
+              )
+            }
+          })
+        )
+      )
+    })()
+  )
+}
+
+// Memoize PromptInput like the bundle does
+const MemoizedPromptInput = memo(PromptInput)
+
+/**
+ * Main Conversation App
+ */
+function ConversationApp({
+  commands = [],
+  dangerouslySkipPermissions = false,
+  debug = false,
+  initialForkNumber = 0,
+  initialPrompt,
+  initialPrNumber,
+  currentSession,
+  messageLogName,
+  shouldShowPromptInput = true,
+  tools = [],
+  verbose = false,
+  initialMessages = [],
+  mcpClients = [],
+  mcpSystemInstructions = '',
+  isDefaultModel = true,
+}) {
+  const effectiveVerbose = verbose || loadConfig().verbose
+
+  // State
+  const [forkNumber, setForkNumber] = useState(initialForkNumber)
+  const [abortController, setAbortController] = useState(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [toolJSX, setToolJSX] = useState(null)
+  const [messages, setMessages] = useState(initialMessages)
+  const [mode, setMode] = useState('prompt')
+  const [showMessageSelector, setShowMessageSelector] = useState(false)
+  const [showModelSelector, setShowModelSelector] = useState(false)
+  const [showAuthSelector, setShowAuthSelector] = useState(false)
+  const [showFastModeToggle, setShowFastModeToggle] = useState(false)
+  const [showMcpManager, setShowMcpManager] = useState(false)
+  const [showConfigManager, setShowConfigManager] = useState(false)
+  const [configSnapshot, setConfigSnapshot] = useState({})
+  const [showApprovedToolsManager, setShowApprovedToolsManager] = useState(false)
+  const [permissionsSnapshot, setPermissionsSnapshot] = useState({ allow: [], deny: [], ask: [] })
+  const [showSessionPicker, setShowSessionPicker] = useState(false)
+  const [showPluginManager, setShowPluginManager] = useState(false)
+  const [showAgentManager, setShowAgentManager] = useState(false)
+  const [showToolsManager, setShowToolsManager] = useState(false)
+  const [showContextManager, setShowContextManager] = useState(false)
+  const [contextManagerItems, setContextManagerItems] = useState([])
+  const [disabledContextItems, setDisabledContextItems] = useState(getDisabledContextItems())
+  const [showSteeringQuestions, setShowSteeringQuestions] = useState(false)
+  const [steeringQuestionsData, setSteeringQuestionsData] = useState(null)
+  const [steeringResolve, setSteeringResolve] = useState(null)
+  const [sessionList, setSessionList] = useState([])
+  const [allProjectSessions, setAllProjectSessions] = useState(null)
+  const [sessionsLoading, setSessionsLoading] = useState(false)
+  const [mcpServersState, setMcpServersState] = useState({})
+  const [mcpClientsState, setMcpClientsState] = useState(mcpClients)
+  const [fastMode, setFastModeState] = useState(isFastMode())
+  const [bypassPermissions, setBypassPermissions] = useState(false)
+  const [currentModel, setCurrentModel] = useState(
+    loadConfig().model || 'claude-sonnet-4-6'
+  )
+  const [contextPercent, setContextPercent] = useState(0)
+
+  // MCP status object for footer — { text, connected, total, hasLazy }
+  const mcpStatus = useMemo(() => {
+    const totalServers = Object.keys(mcpServersState).length
+    if (totalServers === 0) return null
+    const connectedCount = mcpClientsState.filter(c => c.type === 'connected').length
+    const hasLazy = tools.some(t => t._lazy)
+    return { connected: connectedCount, total: totalServers, hasLazy }
+  }, [mcpServersState, mcpClientsState, tools])
+
+  // Git diff stats for footer, refresh after messages change
+  const [gitStats, setGitStats] = useState(null)
+  useEffect(() => {
+    setGitStats(getGitStats())
+  }, [messages.length])
+
+  // Context % for footer
+  useEffect(() => {
+    let cancelled = false
+    const calculateContext = async () => {
+      try {
+        const total = await getTotalContextTokens(messages, tools)
+        if (cancelled) return
+        const limit = 200000
+        setContextPercent(Math.round((total / limit) * 100))
+      } catch(e) {}
+    }
+    const timer = setTimeout(calculateContext, 500)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [messages.length])
+
+  // Build MCP dependency object for config operations
+  const mcpDeps = useMemo(() => ({
+    getGlobalConfig: () => {
+      try {
+        const configPath = path.join(homedir(), '.openclaude', 'config.json')
+        if (existsSync(configPath)) return JSON.parse(readFileSync(configPath, 'utf8'))
+      } catch {}
+      return {}
+    },
+    getProjectConfig: () => {
+      try {
+        const configPath = path.join(process.cwd(), '.openclaude', 'config.json')
+        if (existsSync(configPath)) return JSON.parse(readFileSync(configPath, 'utf8'))
+      } catch {}
+      return {}
+    },
+    setProjectConfig: (config) => {
+      try {
+        const dir = path.join(process.cwd(), '.openclaude')
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+        writeFileSync(path.join(dir, 'config.json'), JSON.stringify(config, null, 2))
+      } catch {}
+    },
+    setGlobalConfig: (config) => {
+      try {
+        const dir = path.join(homedir(), '.openclaude')
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+        const configPath = path.join(dir, 'config.json')
+        // Merge with existing config to avoid clobbering OAuth tokens etc.
+        let existing = {}
+        try { if (existsSync(configPath)) existing = JSON.parse(readFileSync(configPath, 'utf8')) } catch {}
+        writeFileSync(configPath, JSON.stringify({ ...existing, ...config }, null, 2))
+      } catch {}
+    },
+    getMcprcConfig: () => {
+      try {
+        const mcprcPath = path.join(process.cwd(), '.mcprc')
+        if (existsSync(mcprcPath)) return JSON.parse(readFileSync(mcprcPath, 'utf8'))
+      } catch {}
+      return null
+    },
+    getCurrentDir: () => process.cwd(),
+    fs: { existsSync, readFileSync, writeFileSync, mkdirSync },
+    path,
+    logEvent: () => {},
+    logMcpServerMessage: (name, msg) => {
+      if (process.env.DEBUG_TUI) console.error(`[MCP:${name}] ${msg}`)
+    },
+  }), [])
+
+  // Initialize MCP servers list
+  useEffect(() => {
+    try {
+      const servers = getAllMcpServers(mcpDeps)
+      setMcpServersState(servers)
+    } catch {}
+  }, [])
+
+  // MCP Manager handlers
+  const handleMcpAddServer = useCallback((name, config) => {
+    try {
+      addMcpServer(name, config, 'project', mcpDeps)
+      // Refresh server list
+      const servers = getAllMcpServers(mcpDeps)
+      setMcpServersState(servers)
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to add server: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [mcpDeps])
+
+  const handleMcpRemoveServer = useCallback((name) => {
+    try {
+      removeMcpServer(name, 'project', mcpDeps)
+      const servers = getAllMcpServers(mcpDeps)
+      setMcpServersState(servers)
+    } catch (err) {
+      // Try global scope
+      try {
+        removeMcpServer(name, 'global', mcpDeps)
+        const servers = getAllMcpServers(mcpDeps)
+        setMcpServersState(servers)
+      } catch {
+        const msg = createMessage('assistant', `✗ Failed to remove server: ${err.message}`)
+        setMessages(prev => [...prev, msg])
+      }
+    }
+  }, [mcpDeps])
+
+  const handleMcpConnectServer = useCallback(async (name) => {
+    const config = mcpServersState[name]
+    if (!config) return
+    try {
+      const client = await connectToMcpServer(name, config, mcpDeps)
+      setMcpClientsState(prev => [
+        ...prev.filter(c => c.name !== name),
+        { name, client, type: 'connected' }
+      ])
+      const msg = createMessage('assistant', `✓ Connected to MCP server "${name}"`)
+      setMessages(prev => [...prev, msg])
+    } catch (err) {
+      setMcpClientsState(prev => [
+        ...prev.filter(c => c.name !== name),
+        { name, type: 'failed' }
+      ])
+      const msg = createMessage('assistant', `✗ Failed to connect to "${name}": ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [mcpServersState, mcpDeps])
+
+  const handleMcpDisconnectServer = useCallback(async (name) => {
+    const client = mcpClientsState.find(c => c.name === name && c.type === 'connected')
+    if (client?.client) {
+      try { await client.client.close() } catch {}
+    }
+    setMcpClientsState(prev => prev.filter(c => c.name !== name))
+    const msg = createMessage('assistant', `✓ Disconnected from MCP server "${name}"`)
+    setMessages(prev => [...prev, msg])
+  }, [mcpClientsState])
+
+  const handleMcpTestServer = useCallback(async (name) => {
+    const client = mcpClientsState.find(c => c.name === name && c.type === 'connected')
+    if (!client?.client) {
+      const msg = createMessage('assistant', `✗ Server "${name}" is not connected`)
+      setMessages(prev => [...prev, msg])
+      return
+    }
+    try {
+      // Use lenient schema — real servers may return non-standard inputSchema
+      const result = await client.client.request(
+        { method: 'tools/list' },
+        { parse: (v) => v }
+      )
+      const toolCount = result.tools?.length || 0
+      const msg = createMessage('assistant', `✓ Server "${name}" is healthy\n  Tools available: ${toolCount}`)
+      setMessages(prev => [...prev, msg])
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Test failed for "${name}": ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [mcpClientsState])
+
+  const handleMcpMessage = useCallback((text) => {
+    const msg = createMessage('assistant', text)
+    setMessages(prev => [...prev, msg])
+  }, [])
+
+  const handleMcpSetStartupMode = useCallback((name, mode) => {
+    try {
+      updateServerStartupMode(name, mode, mcpDeps)
+      // Refresh server list to reflect new mode
+      const servers = getAllMcpServers(mcpDeps)
+      setMcpServersState(servers)
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to set startup mode: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [mcpDeps])
+
+  // Config Manager: snapshot on open, refresh after mutation
+  const openConfigManager = useCallback(() => {
+    setConfigSnapshot(loadConfig())
+    setShowConfigManager(true)
+  }, [])
+
+  const handleConfigSet = useCallback((key, value) => {
+    try {
+      const config = loadConfig()
+      config[key] = value
+      saveConfig(config)
+      setConfigSnapshot(loadConfig()) // refresh snapshot
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to set config: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [])
+
+  const handleConfigRemove = useCallback((key) => {
+    try {
+      const config = loadConfig()
+      delete config[key]
+      saveConfig(config)
+      setConfigSnapshot(loadConfig()) // refresh snapshot
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to remove config: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [])
+
+  const handleConfigMessage = useCallback((text) => {
+    const msg = createMessage('assistant', text)
+    setMessages(prev => [...prev, msg])
+  }, [])
+
+  // Approved Tools Manager: snapshot on open, refresh after mutation
+  const openApprovedToolsManager = useCallback(() => {
+    const settings = loadSettings()
+    setPermissionsSnapshot(settings.permissions || { allow: [], deny: [], ask: [] })
+    setShowApprovedToolsManager(true)
+  }, [])
+
+  const handleRemoveAllowTool = useCallback((tool) => {
+    try {
+      const settings = loadSettings()
+      const permissions = settings.permissions || { allow: [], deny: [], ask: [] }
+      permissions.allow = permissions.allow.filter(t => t !== tool)
+      settings.permissions = permissions
+      saveSettings(settings)
+      setPermissionsSnapshot({ ...permissions }) // refresh snapshot
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to update permissions: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [])
+
+  const handleRemoveDenyTool = useCallback((tool) => {
+    try {
+      const settings = loadSettings()
+      const permissions = settings.permissions || { allow: [], deny: [], ask: [] }
+      permissions.deny = permissions.deny.filter(t => t !== tool)
+      settings.permissions = permissions
+      saveSettings(settings)
+      setPermissionsSnapshot({ ...permissions }) // refresh snapshot
+    } catch (err) {
+      const msg = createMessage('assistant', `✗ Failed to update permissions: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [])
+
+  const handleApprovedToolsMessage = useCallback((text) => {
+    const msg = createMessage('assistant', text)
+    setMessages(prev => [...prev, msg])
+  }, [])
+
+  // Session Picker handler
+  const handleSessionSelect = useCallback(async (session) => {
+    setShowSessionPicker(false)
+    try {
+      const data = await sessions.getSession(session.id)
+      if (data?.messages && data.messages.length > 0) {
+        // Convert session messages { role, content, timestamp } to TUI format { type, uuid, message }
+        const tuiMessages = data.messages.map(m => createMessage(m.role, m.content))
+        setMessages(tuiMessages)
+        const msg = createMessage('assistant', `\u2713 Resumed session: ${session.firstPrompt?.slice(0, 50) || session.name || session.id.slice(0, 8)}`)
+        setMessages(prev => [...prev, msg])
+      } else {
+        const msg = createMessage('assistant', `\u2717 Session has no messages`)
+        setMessages(prev => [...prev, msg])
+      }
+    } catch (err) {
+      const msg = createMessage('assistant', `\u2717 Failed to resume session: ${err.message}`)
+      setMessages(prev => [...prev, msg])
+    }
+  }, [])
+
+  // Load sessions when picker opens
+  const openSessionPicker = useCallback(async () => {
+    setShowSessionPicker(true)
+    setSessionsLoading(true)
+    setAllProjectSessions(null)
+    try {
+      const list = await sessions.listSessions({ limit: 50 })
+      setSessionList(list)
+    } catch {
+      setSessionList([])
+    } finally {
+      setSessionsLoading(false)
+    }
+  }, [])
+
+  // Open context manager: build item list from current state
+  const openContextManager = useCallback(async () => {
+    const est = (text) => Math.ceil((text || '').length / 4)
+    const items = []
+
+    // System prompt
+    const systemIntro = getSystemPromptIntro()
+    const systemInstructions = await getSystemInstructions()
+    const systemText = [systemIntro, ...systemInstructions].join('\n')
+    items.push({
+      id: 'systemPrompt',
+      label: 'System prompt',
+      tokens: est(systemText),
+      locked: true,  // Cannot disable core system prompt
+    })
+
+    // System tools
+    const mcpToolNames = new Set()
+    for (const t of tools) {
+      if (t.name?.startsWith('mcp__') || t._lazy) mcpToolNames.add(t.name)
+    }
+    const systemToolsList = tools.filter(t => !mcpToolNames.has(t.name))
+    const toolsTokens = systemToolsList.reduce((s, t) => {
+      const desc = typeof t.description === 'string' ? t.description : t.name
+      const schema = t.inputSchema ? JSON.stringify(t.inputSchema) : ''
+      return s + est(t.name + desc + schema)
+    }, 0)
+    items.push({
+      id: 'tools',
+      label: `System tools (${systemToolsList.length})`,
+      tokens: toolsTokens,
+    })
+
+    // MCP tools
+    const mcpToolsList = tools.filter(t => mcpToolNames.has(t.name))
+    if (mcpToolsList.length > 0) {
+      const mcpTokens = mcpToolsList.reduce((s, t) => {
+        const desc = typeof t.description === 'string' ? t.description : t.name
+        const schema = t.inputSchema ? JSON.stringify(t.inputSchema) : ''
+        return s + est(t.name + desc + schema)
+      }, 0)
+      items.push({
+        id: 'mcpTools',
+        label: `MCP tools (${mcpToolsList.length})`,
+        tokens: mcpTokens,
+      })
+    }
+
+    // Memory files (individually toggleable)
+    const { loadClaudeMd } = await import('../../core/config.mjs')
+    const claudeFiles = loadClaudeMd(process.cwd())
+    for (const f of claudeFiles) {
+      items.push({
+        id: `memory:${f.source}`,
+        label: `Memory: ${f.source} (${f.path.split('/').pop()})`,
+        tokens: est(f.content),
+      })
+    }
+
+    // Custom context items
+    const customItems = getCustomContextItems()
+    for (const ci of customItems) {
+      items.push({
+        id: ci.id,
+        label: ci.label,
+        tokens: est(ci.content),
+        isCustom: true,
+      })
+    }
+
+    // Conversation
+    const convTokens = messages.reduce((s, msg) => {
+      const content = msg.message?.content || msg.content
+      const text = typeof content === 'string' ? content : JSON.stringify(content)
+      return s + est(text)
+    }, 0)
+    items.push({
+      id: 'conversation',
+      label: `Conversation (${messages.length} msgs)`,
+      tokens: convTokens,
+      locked: true,  // Cannot disable conversation
+    })
+
+    setContextManagerItems(items)
+    setDisabledContextItems(getDisabledContextItems())
+    setShowContextManager(true)
+  }, [tools, messages])
+
+  // Open steering questions overlay — returns a Promise that resolves with answers
+  const openSteeringQuestions = useCallback((questionsData) => {
+    return new Promise((resolve) => {
+      setSteeringQuestionsData(questionsData)
+      setSteeringResolve(() => resolve)
+      setShowSteeringQuestions(true)
+    })
+  }, [])
+
+  // Load sessions from all projects (Ctrl+A in picker)
+  const loadAllProjectSessions = useCallback(async () => {
+    try {
+      const all = await sessions.listAllProjectSessions({ limit: 100 })
+      setAllProjectSessions(all)
+    } catch {
+      setAllProjectSessions([])
+    }
+  }, [])
+
+  // Preview a session (Ctrl+V in picker) — load full messages for preview
+  const handleSessionPreview = useCallback(async (session) => {
+    if (session.messages && session.messages.length > 0) return
+    try {
+      const data = await sessions.getSession(session.id)
+      if (data?.messages) {
+        session.messages = data.messages
+      }
+    } catch {
+      // Preview will show empty if load fails
+    }
+  }, [])
+
+  // Rename a session (Ctrl+R in picker)
+  const handleSessionRename = useCallback(async (session, newName) => {
+    try {
+      await sessions.updateSession(session.id, { name: newName })
+      // Update the local session list
+      setSessionList(prev => prev.map(s =>
+        s.id === session.id ? { ...s, name: newName, firstPrompt: newName } : s
+      ))
+      if (allProjectSessions) {
+        setAllProjectSessions(prev => prev?.map(s =>
+          s.id === session.id ? { ...s, name: newName, firstPrompt: newName } : s
+        ))
+      }
+    } catch {
+      // Rename failed silently
+    }
+  }, [allProjectSessions])
+
+  // Abort operation
+  const cancelOperation = useCallback(() => {
+    if (!isLoading) return
+    setIsLoading(false)
+    abortController?.abort()
+  }, [isLoading, abortController])
+
+  // Handle user query — accepts string or { text, attachments }
+  const handleQuery = useCallback(async (queryInput) => {
+    if (!queryInput || isLoading) return
+
+    // Extract text and attachments
+    let queryText, queryAttachments = []
+    if (typeof queryInput === 'object' && queryInput.text !== undefined) {
+      queryText = queryInput.text
+      queryAttachments = queryInput.attachments || []
+    } else {
+      queryText = queryInput
+    }
+
+    if (!queryText && queryAttachments.length === 0) return
+
+    // Handle slash commands (text only, no attachments)
+    if (queryText && queryText.startsWith('/')) {
+      const parts = queryText.slice(1).split(/\s+/)
+      const cmdName = parts[0].toLowerCase()
+      const cmdArgs = parts.slice(1).join(' ')
+
+      // Find command
+      const cmd = commands.find(c =>
+        c.name === cmdName ||
+        c.userFacingName?.() === cmdName ||
+        c.aliases?.includes(cmdName)
+      )
+
+      if (cmd) {
+        // Show user input
+        const userMessage = createMessage('user', queryText)
+        setMessages(prev => [...prev, userMessage])
+
+        try {
+          const result = await cmd.call?.(null, {
+            args: cmdArgs ? cmdArgs.split(/\s+/) : [],
+            getMessages: () => messages,
+            setMessages: (newMessages) => setMessages(newMessages),
+            clearMessages: () => setMessages([]),
+            tools,
+            mcpServers: mcpServersState,
+            mcpClients: mcpClientsState,
+            showModelSelector: () => setShowModelSelector(true),
+            showAuthSelector: () => setShowAuthSelector(true),
+            showFastModeToggle: () => setShowFastModeToggle(true),
+            showMcpManager: () => setShowMcpManager(true),
+            showConfigManager: () => openConfigManager(),
+            showApprovedToolsManager: () => openApprovedToolsManager(),
+            showSessionPicker: () => openSessionPicker(),
+            showPluginManager: () => setShowPluginManager(true),
+            showAgentManager: () => setShowAgentManager(true),
+            showToolsManager: () => setShowToolsManager(true),
+            showContextManager: () => openContextManager(),
+            showSteeringQuestions: (data) => openSteeringQuestions(data),
+          })
+
+          // Handle command result
+          if (result) {
+            // Check if result is a special action
+            if (typeof result === 'object' && result.action === 'clear_messages') {
+              setMessages([])
+              return
+            }
+            if (typeof result === 'object' && result.action === 'compact_messages') {
+              // Compact command returned compacted messages for us to apply
+              if (result.compacted) {
+                setMessages(result.compacted)
+                const msg = createMessage('assistant', `✓ Compacted conversation: ${result.removed} older messages summarized`)
+                setMessages(prev => [...prev, msg])
+              } else if (result.error) {
+                const msg = createMessage('assistant', result.error)
+                setMessages(prev => [...prev, msg])
+              }
+              return
+            }
+            // Show command result as assistant message
+            const assistantMessage = createMessage('assistant', result)
+            setMessages(prev => [...prev, assistantMessage])
+          }
+        } catch (e) {
+          const errorMessage = createMessage('assistant', `Command error: ${e.message}`)
+          setMessages(prev => [...prev, errorMessage])
+        }
+        return
+      } else {
+        // Unknown command - show error
+        const userMessage = createMessage('user', queryText)
+        const errorMessage = createMessage('assistant', `Unknown command: /${cmdName}\nType /help for available commands.`)
+        setMessages(prev => [...prev, userMessage, errorMessage])
+        return
+      }
+    }
+
+    setIsLoading(true)
+    const controller = new AbortController()
+    setAbortController(controller)
+
+    try {
+      let currentMessages = [...messages];
+
+      // Auto-compaction check (CC 2.x feature)
+      if (contextPercent > 80 && currentMessages.length > 10) {
+        const { compactMessagesWithAi } = await import('../../utils/summarize.mjs');
+        const compactingMsg = createMessage('assistant', 'Context is getting full, compacting conversation history...');
+        setMessages(prev => [...prev, compactingMsg]);
+        
+        const compacted = await compactMessagesWithAi(currentMessages);
+        const removedCount = currentMessages.length - compacted.length;
+        
+        if (removedCount > 0) {
+          const confirmationMsg = createMessage('assistant', `✓ Compacted ${removedCount} older messages.`);
+          setMessages([...compacted, confirmationMsg]);
+          currentMessages = [...compacted, confirmationMsg];
+        } else {
+          // Remove the 'compacting...' message if it failed
+          setMessages(currentMessages);
+        }
+      }
+
+      // Create user message — multipart content if images attached
+      let userContent
+      if (queryAttachments.length > 0) {
+        const { processImage } = await import('../../core/utils.mjs')
+        const contentBlocks = []
+        for (const att of queryAttachments) {
+          try {
+            const imageBlock = await processImage(att.path)
+            contentBlocks.push(imageBlock)
+          } catch (e) {
+            contentBlocks.push({ type: 'text', text: `[Failed to load image: ${att.name} — ${e.message}]` })
+          }
+        }
+        if (queryText) {
+          contentBlocks.push({ type: 'text', text: queryText })
+        }
+        userContent = contentBlocks
+      } else {
+        userContent = queryText
+      }
+      const userMessage = createMessage('user', userContent)
+      setMessages(prev => [...prev, userMessage])
+
+      // Get system prompts (REQUIRED for OAuth!)
+      const systemIntro = getSystemPromptIntro()
+      const systemInstructions = await getSystemInstructions()
+      const systemPrompts = [systemIntro, ...systemInstructions]
+
+      // Inject MCP server instructions if available
+      if (mcpSystemInstructions) {
+        systemPrompts.push(mcpSystemInstructions)
+      }
+
+      // Filter tools based on disabled context items
+      const ctxDisabled = getDisabledContextItems()
+      let activeTools = tools
+      if (ctxDisabled['tools'] || ctxDisabled['mcpTools']) {
+        activeTools = tools.filter(t => {
+          const isMcp = t.name?.startsWith('mcp__') || t._lazy
+          if (isMcp && ctxDisabled['mcpTools']) return false
+          if (!isMcp && ctxDisabled['tools']) return false
+          return true
+        })
+      }
+
+      // Stream conversation
+      for await (const assistantMessage of streamConversation(
+        [...currentMessages, userMessage],
+        systemPrompts,
+        activeTools,
+        {
+          verbose: effectiveVerbose,
+          model: currentModel,
+          fastMode,
+          dangerouslySkipPermissions: dangerouslySkipPermissions || bypassPermissions,
+        },
+        controller
+      )) {
+        setMessages(prev => {
+          // Replace or add assistant message
+          const lastIdx = prev.findIndex(m =>
+            m.type === 'assistant' && m.uuid === assistantMessage.uuid
+          )
+          if (lastIdx >= 0) {
+            const updated = [...prev]
+            updated[lastIdx] = assistantMessage
+            return updated
+          }
+          return [...prev, assistantMessage]
+        })
+      }
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        // Show error as assistant message with helpful context
+        const errorText = error.message || formatError(error) || 'Unknown error occurred'
+
+        let helpText = ''
+        if (errorText.includes('API_KEY') || errorText.includes('authentication')) {
+          helpText = '\n\nPlease set ANTHROPIC_API_KEY in your .env file or run /auth to authenticate with OAuth.'
+        } else if (errorText.includes('ENOENT') || errorText.includes('not found')) {
+          helpText = '\n\nThe requested file or resource could not be found.'
+        } else if (errorText.includes('EACCES') || errorText.includes('permission')) {
+          helpText = '\n\nPermission denied. Check file permissions.'
+        } else if (errorText.includes('network') || errorText.includes('ECONNREFUSED')) {
+          helpText = '\n\nNetwork error. Check your internet connection.'
+        }
+
+        const errorMessage = createMessage('assistant', `❌ Error: ${errorText}${helpText}`)
+        setMessages(prev => [...prev, errorMessage])
+
+        // Log full error for debugging
+        if (debug) {
+          console.error('[TUI] Full error:', error)
+        }
+      }
+    } finally {
+      setIsLoading(false)
+      setAbortController(null)
+    }
+  }, [messages, tools, effectiveVerbose, isLoading, commands, currentModel, bypassPermissions, dangerouslySkipPermissions])
+
+  // Run initial prompt
+  useEffect(() => {
+    if (initialPrompt) {
+      handleQuery(initialPrompt)
+    }
+  }, [])
+
+  // REMOVED: useInput hook that was blocking PromptInput's keyboard handling
+  // Escape-during-loading is now handled by PromptInput itself
+
+  // Normalized messages for rendering
+  const normalizedMessages = useMemo(() =>
+    normalizeMessages(messages).filter(m => m.type !== 'progress'),
+    [messages]
+  )
+
+  // Build message items for Static rendering
+  const messageItems = useMemo(() => {
+    const items = [
+      // Header
+      {
+        type: 'static',
+        key: `header-${forkNumber}`,
+        jsx: React.createElement(Box, {
+          flexDirection: 'column',
+          key: `logo${forkNumber}`
+        },
+          React.createElement(WelcomeBanner, {
+            mcpClients,
+            isDefaultModel
+          }),
+          React.createElement(WorkspaceTips, {
+            workspaceDir: process.cwd()
+          })
+        )
+      },
+      // Messages
+      ...normalizedMessages.map((msg, idx) => ({
+        type: 'static',
+        key: msg.uuid || `msg-${idx}`,
+        jsx: React.createElement(Box, {
+          key: msg.uuid || idx,
+          width: '100%'
+        },
+          React.createElement(MessageRenderer, {
+            message: msg,
+            messages: normalizedMessages,
+            tools,
+            verbose: effectiveVerbose,
+            debug,
+            addMargin: true,
+            shouldShowDot: true,
+          })
+        )
+      }))
+    ]
+    return items
+  }, [forkNumber, normalizedMessages, effectiveVerbose, debug, mcpClients, isDefaultModel])
+
+  const staticItems = messageItems.filter(item => item.type === 'static').map(item => item.jsx)
+
+  return React.createElement(Box, { flexDirection: 'column' },
+    // Static messages - render directly
+    ...staticItems,
+
+    // Loading indicator
+    !toolJSX && isLoading ? React.createElement(LoadingSpinner, { key: 'loading' }) : null,
+
+    // Tool JSX (overlays)
+    toolJSX?.jsx ? React.cloneElement(toolJSX.jsx, { key: 'tool-jsx' }) : null,
+
+    // Model Selector Overlay
+    showModelSelector
+      ? React.createElement(ModelSelector, {
+          key: 'model-selector',
+          currentModel,
+          onSelect: (model) => {
+            setCurrentModel(model.id)
+            setShowModelSelector(false)
+            // Update config
+            const config = loadConfig()
+            saveConfig({ ...config, model: model.id })
+            // Show confirmation
+            const msg = createMessage('assistant', `✓ Switched to ${model.name}\n  Model ID: ${model.id}`)
+            setMessages(prev => [...prev, msg])
+          },
+          onCancel: () => setShowModelSelector(false)
+        })
+      : null,
+
+    // Fast Mode Toggle Overlay
+    showFastModeToggle
+      ? React.createElement(FastModeToggle, {
+          key: 'fast-mode-toggle',
+          onConfirm: ({ enabled }) => {
+            setFastMode(enabled)
+            setFastModeState(enabled)
+            setShowFastModeToggle(false)
+            if (enabled) {
+              // Switch model to Opus 4.6
+              setCurrentModel(getFastModeModel())
+              const config = loadConfig()
+              saveConfig({ ...config, model: getFastModeModel() })
+              const msg = createMessage('assistant', `↯ Fast mode ON · model set to ${getFastModeDisplayName()}`)
+              setMessages(prev => [...prev, msg])
+            } else {
+              const msg = createMessage('assistant', 'Fast mode OFF')
+              setMessages(prev => [...prev, msg])
+            }
+          },
+          onCancel: () => setShowFastModeToggle(false)
+        })
+      : null,
+
+    // Auth Selector Overlay
+    showAuthSelector
+      ? React.createElement(AuthSelector, {
+          key: 'auth-selector',
+          onSelect: async (option) => {
+            setShowAuthSelector(false)
+            // Set OAuth mode based on selection
+            setOAuthMode(option.id)
+            // Show authenticating message
+            const authMsg = createMessage('assistant', `Authenticating with ${option.name}...\nOpening browser...\n\nIMPORTANT: After authorizing, paste the code in your terminal (not here!)`)
+            setMessages(prev => [...prev, authMsg])
+
+            // Perform OAuth - this will handle stdin/stdout directly
+            try {
+              await authenticateWithOAuth()
+              // Reset client so it picks up the new token
+              resetClient()
+              const successMsg = createMessage('assistant', `✓ Successfully authenticated with ${option.name}!\nYou can now use the API.`)
+              setMessages(prev => [...prev, successMsg])
+            } catch (error) {
+              const errorMsg = createMessage('assistant', `✗ Authentication failed: ${error.message}\n\nAlternatively, set ANTHROPIC_API_KEY in your .env file`)
+              setMessages(prev => [...prev, errorMsg])
+            }
+          },
+          onCancel: () => setShowAuthSelector(false)
+        })
+      : null,
+
+    // MCP Manager Overlay
+    showMcpManager
+      ? React.createElement(McpManager, {
+          key: 'mcp-manager',
+          servers: mcpServersState,
+          clients: mcpClientsState,
+          onAddServer: handleMcpAddServer,
+          onRemoveServer: handleMcpRemoveServer,
+          onConnectServer: handleMcpConnectServer,
+          onDisconnectServer: handleMcpDisconnectServer,
+          onTestServer: handleMcpTestServer,
+          onSetStartupMode: handleMcpSetStartupMode,
+          onCancel: () => setShowMcpManager(false),
+          onMessage: handleMcpMessage,
+        })
+      : null,
+
+    // Config Manager Overlay
+    showConfigManager
+      ? React.createElement(ConfigManager, {
+          key: 'config-manager',
+          config: configSnapshot,
+          onSet: handleConfigSet,
+          onRemove: handleConfigRemove,
+          onCancel: () => setShowConfigManager(false),
+          onMessage: handleConfigMessage,
+        })
+      : null,
+
+    // Approved Tools Manager Overlay
+    showApprovedToolsManager
+      ? React.createElement(ApprovedToolsManager, {
+          key: 'approved-tools-manager',
+          permissions: permissionsSnapshot,
+          onRemoveAllow: handleRemoveAllowTool,
+          onRemoveDeny: handleRemoveDenyTool,
+          onCancel: () => setShowApprovedToolsManager(false),
+          onMessage: handleApprovedToolsMessage,
+        })
+      : null,
+
+    // Session Picker Overlay
+    showSessionPicker
+      ? React.createElement(SessionPicker, {
+          key: 'session-picker',
+          sessions: sessionList,
+          allSessions: allProjectSessions,
+          isLoading: sessionsLoading,
+          onSelect: handleSessionSelect,
+          onCancel: () => setShowSessionPicker(false),
+          onLoadAllProjects: loadAllProjectSessions,
+          onPreview: handleSessionPreview,
+          onRename: handleSessionRename,
+        })
+      : null,
+
+    // Plugin Manager Overlay
+    showPluginManager
+      ? React.createElement(PluginManager, {
+          key: 'plugin-manager',
+          installedPlugins: getRegisteredPlugins().map(name => {
+            const manifest = loadPluginManifest(name)
+            return {
+              name,
+              version: manifest?.version || 'unknown',
+              status: getPluginStatus(name),
+              description: manifest?.description || '',
+            }
+          }),
+          onInstall: async (pluginName) => {
+            const samplePath = getSamplePluginPath(pluginName)
+            if (samplePath) {
+              await installFromLocal(samplePath)
+            } else {
+              await installFromNpm(pluginName)
+            }
+          },
+          onUninstall: async (pluginName) => {
+            await uninstallPlugin(pluginName)
+          },
+          onEnable: (pluginName) => {
+            registryEnablePlugin(pluginName)
+          },
+          onDisable: (pluginName) => {
+            registryDisablePlugin(pluginName)
+          },
+          onCancel: () => setShowPluginManager(false),
+          onMessage: (msg) => {
+            const assistantMessage = createMessage('assistant', msg)
+            setMessages(prev => [...prev, assistantMessage])
+          },
+        })
+      : null,
+
+    // Agent Manager Overlay
+    showAgentManager
+      ? React.createElement(AgentManager, {
+          key: 'agent-manager',
+          tools,
+          onCancel: () => setShowAgentManager(false),
+          onMessage: (msg) => {
+            const assistantMessage = createMessage('assistant', msg)
+            setMessages(prev => [...prev, assistantMessage])
+          },
+          onDeleteAgent: (agentName) => {
+            deleteCustomAgent(agentName)
+          },
+        })
+      : null,
+
+    // Tools Manager Overlay
+    showToolsManager
+      ? React.createElement(ToolsManager, {
+          key: 'tools-manager',
+          tools,
+          onCancel: () => setShowToolsManager(false),
+          onMessage: (msg) => {
+            const assistantMessage = createMessage('assistant', msg)
+            setMessages(prev => [...prev, assistantMessage])
+          },
+        })
+      : null,
+
+    // Context Manager Overlay
+    showContextManager
+      ? React.createElement(ContextManager, {
+          key: 'context-manager',
+          contextItems: contextManagerItems,
+          disabledItems: disabledContextItems,
+          onToggle: (itemId) => {
+            const newDisabled = toggleContextItem(itemId)
+            setDisabledContextItems(getDisabledContextItems())
+            const label = contextManagerItems.find(i => i.id === itemId)?.label || itemId
+            const msg = createMessage('assistant',
+              newDisabled
+                ? `○ Disabled context: ${label}`
+                : `● Enabled context: ${label}`
+            )
+            setMessages(prev => [...prev, msg])
+          },
+          onAdd: async (type, value) => {
+            try {
+              let label, content, source
+              if (type === 'file') {
+                const filePath = value.startsWith('~') ? value.replace('~', homedir()) : value
+                if (!existsSync(filePath)) {
+                  const msg = createMessage('assistant', `✗ File not found: ${value}`)
+                  setMessages(prev => [...prev, msg])
+                  return
+                }
+                content = readFileSync(filePath, 'utf-8')
+                label = `File: ${basename(filePath)}`
+                source = filePath
+              } else if (type === 'url') {
+                try {
+                  const resp = await fetch(value)
+                  content = await resp.text()
+                  // Rough HTML-to-text: strip tags
+                  content = content.replace(/<script[\s\S]*?<\/script>/gi, '')
+                    .replace(/<style[\s\S]*?<\/style>/gi, '')
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                  if (content.length > 50000) content = content.slice(0, 50000) + '\n...(truncated)'
+                  label = `URL: ${new URL(value).hostname}${new URL(value).pathname.slice(0, 30)}`
+                  source = value
+                } catch (e) {
+                  const msg = createMessage('assistant', `✗ Failed to fetch URL: ${e.message}`)
+                  setMessages(prev => [...prev, msg])
+                  return
+                }
+              } else if (type === 'docs') {
+                // Use Context7 MCP if available, otherwise store as text note
+                const c7Tool = tools.find(t => t.name === 'mcp__plugin_compound-engineering_context7__resolve-library-id')
+                if (c7Tool) {
+                  label = `Docs: ${value}`
+                  content = `[Context7 docs search pending: "${value}" — will be resolved on next API call]`
+                  source = `context7:${value}`
+                } else {
+                  label = `Docs: ${value}`
+                  content = `Documentation reference: ${value}`
+                  source = `docs:${value}`
+                }
+              } else {
+                // text note
+                label = `Note: ${value.slice(0, 40)}${value.length > 40 ? '...' : ''}`
+                content = value
+                source = 'text'
+              }
+
+              const entry = addCustomContextItem({ type, label, source, content })
+              const msg = createMessage('assistant', `✓ Added context: ${label}`)
+              setMessages(prev => [...prev, msg])
+              // Refresh the manager items
+              openContextManager()
+            } catch (e) {
+              const msg = createMessage('assistant', `✗ Error adding context: ${e.message}`)
+              setMessages(prev => [...prev, msg])
+            }
+          },
+          onRemove: (itemId) => {
+            const label = contextManagerItems.find(i => i.id === itemId)?.label || itemId
+            const removed = removeCustomContextItem(itemId)
+            if (removed) {
+              const msg = createMessage('assistant', `✓ Removed context: ${label}`)
+              setMessages(prev => [...prev, msg])
+              // Refresh the manager items
+              openContextManager()
+            }
+          },
+          onCancel: () => setShowContextManager(false),
+          onMessage: (msg) => {
+            const assistantMessage = createMessage('assistant', msg)
+            setMessages(prev => [...prev, assistantMessage])
+          },
+        })
+      : null,
+
+    // Steering Questions Overlay
+    showSteeringQuestions && steeringQuestionsData
+      ? React.createElement(SteeringQuestions, {
+          key: 'steering-questions',
+          questions: steeringQuestionsData,
+          onSubmit: (answers) => {
+            setShowSteeringQuestions(false)
+            setSteeringQuestionsData(null)
+            if (steeringResolve) {
+              steeringResolve(answers)
+              setSteeringResolve(null)
+            }
+            // Format answers into a readable message
+            const lines = Object.entries(answers).map(([id, val]) => {
+              const q = steeringQuestionsData.find(q => q.id === id)
+              const header = q?.header || id
+              const display = Array.isArray(val) ? val.join(', ') : val
+              return `  ${header}: ${display}`
+            })
+            if (lines.length > 0) {
+              const msg = createMessage('assistant', `✓ Steering answers:\n${lines.join('\n')}`)
+              setMessages(prev => [...prev, msg])
+            }
+          },
+          onCancel: () => {
+            setShowSteeringQuestions(false)
+            setSteeringQuestionsData(null)
+            if (steeringResolve) {
+              steeringResolve(null)
+              setSteeringResolve(null)
+            }
+          },
+          onChat: (question, tabIndex) => {
+            // Close overlay and inject the question into conversation
+            setShowSteeringQuestions(false)
+            setSteeringQuestionsData(null)
+            if (steeringResolve) {
+              steeringResolve(null)
+              setSteeringResolve(null)
+            }
+            const chatMsg = createMessage('user', `Help me decide: ${question.question}`)
+            setMessages(prev => [...prev, chatMsg])
+            handleQuery(`Help me decide: ${question.question}`)
+          },
+        })
+      : null,
+
+    // Message Selector Overlay
+    showMessageSelector
+      ? React.createElement(MessageSelector, {
+          key: 'message-selector',
+          messages,
+          onSelect: (messageIndex) => {
+            // Fork conversation from selected message
+            setForkNumber(n => n + 1)
+            setMessages(prev => prev.slice(0, messageIndex + 1))
+            setShowMessageSelector(false)
+            // Show confirmation
+            const msg = createMessage('assistant', `✓ Conversation forked from message ${messageIndex + 1}`)
+            setMessages(prev => [...prev, msg])
+          },
+          onCancel: () => setShowMessageSelector(false)
+        })
+      : null,
+
+    // Prompt input
+    !toolJSX?.shouldHidePromptInput && shouldShowPromptInput && !showMessageSelector && !showModelSelector && !showAuthSelector && !showFastModeToggle && !showMcpManager && !showConfigManager && !showApprovedToolsManager && !showSessionPicker && !showPluginManager && !showAgentManager && !showToolsManager && !showContextManager && !showSteeringQuestions
+      ? React.createElement(MemoizedPromptInput, {
+          key: 'prompt-input',
+          commands,
+          tools,
+          isDisabled: false,
+          isLoading,
+          onQuery: handleQuery,
+          onCancel: cancelOperation,
+          debug,
+          verbose: effectiveVerbose,
+          messages,
+          mode,
+          onModeChange: setMode,
+          onShowMessageSelector: () => setShowMessageSelector(s => !s),
+          mcpStatus,
+          gitStats,
+          onBypassPermissionsChange: setBypassPermissions,
+        })
+      : null,
+
+    // Prompt footer (CC 2.x feature)
+      !isLoading && !toolJSX?.shouldHidePromptInput && shouldShowPromptInput && !showMessageSelector && !showModelSelector && !showAuthSelector && !showFastModeToggle && !showMcpManager && !showConfigManager && !showApprovedToolsManager && !showSessionPicker && !showPluginManager && !showAgentManager && !showToolsManager && !showContextManager && !showSteeringQuestions
+        ? React.createElement(PromptFooter, {
+            session: currentSession,
+            prNumber: initialPrNumber,
+            contextPercent: contextPercent,
+          })
+        : null
+    )
+}
+
+/**
+ * Main entry point
+ */
+async function main() {
+  // Check for TTY - if not interactive, show a simple message
+  if (!process.stdin.isTTY) {
+    process.exit(0)
+  }
+
+  const config = loadConfig()
+  const toolSchemas = await getAllTools()  // For API
+
+  // Create actual tool objects with call() methods for execution
+  const { createAllTools } = await import('../../tools/index.mjs')
+  // Use simple exec without sandbox for now (sandbox has unix-socket-open error)
+  const { exec } = await import('child_process')
+  const { promisify } = await import('util')
+  const execAsync = promisify(exec)
+  const executeCommand = async (cmd, opts) => {
+    const result = await execAsync(cmd, { ...opts, maxBuffer: 30 * 1024 * 1024 })
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 }
+  }
+  const utils = await import('../../core/utils.mjs')
+  const fs = await import('fs')
+  const os = await import('os')
+
+  const toolObjects = createAllTools({
+    fs,
+    path,
+    os,
+    executeCommand: executeCommand,
+    getCurrentDir: utils.getCurrentDir,
+    getOriginalDir: utils.getOriginalDir,
+    resolvePath: utils.resolvePath,
+    isAbsolutePath: utils.isAbsolutePath,
+    fileExists: utils.fileExists,
+    getFileStats: utils.getFileStats,
+    findSimilarFile: utils.findSimilarFile,
+    isInAllowedDirectory: () => true,
+    detectEncoding: utils.detectEncoding,
+    detectLineEnding: utils.detectLineEnding,
+    normalizeLineEndings: utils.normalizeLineEndings,
+    writeFile: utils.writeFile,
+    globFiles: utils.globFiles,
+    runRipgrep: utils.runRipgrep,
+    processImage: utils.processImage,
+    logError: console.error,
+    logEvent: () => {},
+    React
+  })
+  let tools = Object.values(toolObjects)
+
+  // Initialize MCP servers lazily (don't spawn processes until first tool call)
+  let mcpClients = []
+  let mcpSystemInstructions = ''
+  try {
+    const { initializeMcpLazy } = await import('../../integration/mcp.mjs')
+    const mcpDeps = {
+      getGlobalConfig: () => {
+        try {
+          const configPath = path.join(os.homedir(), '.openclaude', 'config.json')
+          if (fs.existsSync(configPath)) return JSON.parse(fs.readFileSync(configPath, 'utf8'))
+        } catch {}
+        return {}
+      },
+      getProjectConfig: () => {
+        try {
+          const configPath = path.join(process.cwd(), '.openclaude', 'config.json')
+          if (fs.existsSync(configPath)) return JSON.parse(fs.readFileSync(configPath, 'utf8'))
+        } catch {}
+        return {}
+      },
+      setProjectConfig: (config) => {
+        try {
+          const dir = path.join(process.cwd(), '.openclaude')
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+          fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(config, null, 2))
+        } catch {}
+      },
+      setGlobalConfig: (config) => {
+        try {
+          const dir = path.join(os.homedir(), '.openclaude')
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+          const configPath = path.join(dir, 'config.json')
+          // Merge with existing config to avoid clobbering OAuth tokens etc.
+          let existing = {}
+          try { if (fs.existsSync(configPath)) existing = JSON.parse(fs.readFileSync(configPath, 'utf8')) } catch {}
+          fs.writeFileSync(configPath, JSON.stringify({ ...existing, ...config }, null, 2))
+        } catch {}
+      },
+      getMcprcConfig: () => {
+        try {
+          const mcprcPath = path.join(process.cwd(), '.mcprc')
+          if (fs.existsSync(mcprcPath)) return JSON.parse(fs.readFileSync(mcprcPath, 'utf8'))
+        } catch {}
+        return null
+      },
+      getCurrentDir: () => process.cwd(),
+      fs,
+      path,
+      logEvent: () => {},
+      logMcpServerMessage: (name, msg) => {
+        if (process.env.DEBUG_TUI) console.error(`[MCP:${name}] ${msg}`)
+      },
+    }
+
+    // replaceTools callback: when a lazy server connects, swap proxy tools for real ones
+    const replaceTools = (serverName, realTools, clientInfo) => {
+      // Replace proxy tools with real tools in the tools array
+      tools = tools.filter(t => !t._lazy || t._serverName !== serverName)
+      tools.push(...realTools)
+
+      // Track the connected client
+      mcpClients = [
+        ...mcpClients.filter(c => c.name !== serverName),
+        clientInfo,
+      ]
+
+      if (process.env.DEBUG_TUI) {
+        console.error(`[MCP:Lazy] ${serverName}: replaced proxies with ${realTools.length} real tools`)
+      }
+    }
+
+    const mcpResult = await initializeMcpLazy(mcpDeps, replaceTools)
+    mcpSystemInstructions = mcpResult.systemInstructions
+
+    if (mcpResult.tools.length > 0) {
+      tools = [...tools, ...mcpResult.tools]
+      if (process.env.DEBUG_TUI) {
+        console.error(`[MCP:Lazy] Created ${mcpResult.tools.length} proxy tools for ${mcpResult.serverNames.length} servers`)
+      }
+    }
+
+    // Schedule eager connections for "always" mode servers (5s after startup, staggered)
+    if (mcpResult.eagerServers?.length > 0) {
+      const { connectEagerServers } = await import('../../integration/mcp.mjs')
+      setTimeout(() => {
+        connectEagerServers(mcpResult.eagerServers, mcpDeps, replaceTools)
+          .catch(err => {
+            if (process.env.DEBUG_TUI) {
+              console.error('[MCP:Eager] Failed:', err.message)
+            }
+          })
+      }, 5000)
+    }
+  } catch (error) {
+    if (process.env.DEBUG_TUI) {
+      console.error('[MCP] Failed to initialize:', error.message)
+    }
+  }
+
+  // Load all commands: localCommands FIRST (real implementations from commands.mjs),
+  // then standardCommands (TUI-only: help, quit, version, overlay wrappers),
+  // then customCommands (user ~/.claude/commands/*.md).
+  // .find() returns the first match, so localCommands take precedence over stubs.
+  let commands = [...standardCommands]
+  try {
+    const localCommands = getLocalCommands()
+    const customCommands = loadCustomCommands()
+    commands = [...localCommands, ...standardCommands, ...customCommands]
+    if (process.env.DEBUG_TUI) {
+      console.error('[Commands] Loaded:', commands.length, 'commands')
+      console.error('[Commands] Custom:', customCommands.length, 'from ~/.claude/commands')
+    }
+  } catch (e) {
+    console.error('[Commands] Failed to load:', e.message)
+  }
+
+  // Run SessionStart hooks
+  try {
+    const { runSessionStart } = await import('../../core/hooks.mjs')
+    await runSessionStart(Date.now().toString(), {
+      file: '', // Empty string to satisfy hook requirements
+      cwd: process.cwd()
+    })
+  } catch (error) {
+    console.error('[Hook] SessionStart error:', error.message)
+  }
+
+  // Handle graceful exit
+  const handleExit = () => {
+    // Clear screen and exit cleanly
+    process.stdout.write('\x1b[?25h') // Show cursor
+    process.exit(0)
+  }
+
+  process.on('SIGINT', handleExit)
+  process.on('SIGTERM', handleExit)
+
+  // Render app with error boundary
+  try {
+    const { unmount } = render(
+      React.createElement(ErrorBoundary, null,
+        React.createElement(ConversationApp, {
+          commands,
+          debug: process.argv.includes('--debug'),
+          initialPrompt: process.env.INITIAL_PROMPT || process.argv[2],
+          initialPrNumber: config.prNumber,
+          currentSession: config.currentSession,
+          messageLogName: new Date().toISOString(),
+          shouldShowPromptInput: true,
+          tools,
+          verbose: config.verbose || process.argv.includes('--verbose'),
+          mcpClients,
+          mcpSystemInstructions,
+        })
+      ),
+      {
+        exitOnCtrlC: false, // We handle it ourselves
+        patchConsole: false
+      }
+    )
+
+    // Handle Ctrl+C gracefully
+    process.on('SIGINT', () => {
+      unmount()
+      process.stdout.write('\x1b[?25h') // Show cursor
+      process.exit(0)
+    })
+  } catch (error) {
+    console.error('Failed to render TUI:', error.message)
+    process.exit(1)
+  }
+}
+
+// Run
+main().catch((error) => {
+  console.error('Fatal error:', error)
+  process.exit(1)
+})
+
+export { ConversationApp, MessageRenderer, PromptInput, WelcomeBanner }

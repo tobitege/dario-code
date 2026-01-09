@@ -1,0 +1,38 @@
+# Chunk files from deminification process (working files)
+chunks/
+
+# Claude Code local settings
+.claude/*.local.*
+
+# Node
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# Build artifacts
+dist/
+*.tgz
+
+# Environment
+.env
+.env.local
+
+# CRITICAL: Exclude deminification evidence
+.deminification/
+minified/
+cli.bundle.mjs
+/.evals
+/archive
+/vendor
+/.pi/worktrees/1770506456818-tvmwzw

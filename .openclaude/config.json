@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "test-server": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "tests/test-mcp-server.mjs"
+      ],
+      "startupMode": "asneeded"
+    },
+    "claude": {
+      "type": "stdio",
+      "command": "claude",
+      "args": [
+        "mcp",
+        "serve"
+      ],
+      "startupMode": "asneeded"
+    }
+  }
+}

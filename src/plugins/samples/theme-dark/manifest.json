@@ -1,0 +1,23 @@
+{
+  "name": "theme-dark",
+  "version": "1.0.0",
+  "description": "Custom dark color theme for the TUI. Config-only plugin — no code, just style overrides.",
+  "author": "openclaude",
+  "license": "MIT",
+  "entry": "index.mjs",
+  "commands": [],
+  "tools": [],
+  "config": {
+    "theme": {
+      "primary": "#A78BFA",
+      "text": "#E5E5E5",
+      "secondaryText": "#6B7280",
+      "border": "#374151",
+      "success": "#34D399",
+      "error": "#F87171",
+      "warning": "#FBBF24",
+      "accent": "#60A5FA",
+      "background": "#111827"
+    }
+  }
+}

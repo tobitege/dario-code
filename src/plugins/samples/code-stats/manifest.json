@@ -1,0 +1,25 @@
+{
+  "name": "code-stats",
+  "version": "1.0.0",
+  "description": "Counts lines of code, functions, and classes across your project. Adds a line_counter tool.",
+  "author": "openclaude",
+  "license": "MIT",
+  "entry": "index.mjs",
+  "commands": [],
+  "tools": [
+    {
+      "name": "line_counter",
+      "description": "Count lines of code in a file or directory",
+      "parameters": {
+        "path": {
+          "type": "string",
+          "description": "File or directory path to count"
+        }
+      }
+    }
+  ],
+  "config": {
+    "extensions": [".js", ".mjs", ".ts", ".tsx", ".py", ".rb", ".go", ".rs"],
+    "ignorePatterns": ["node_modules", ".git", "dist", "build"]
+  }
+}

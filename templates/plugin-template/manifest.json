@@ -1,0 +1,26 @@
+{
+  "name": "plugin-template",
+  "version": "0.1.0",
+  "description": "A template plugin demonstrating the plugin system structure",
+  "author": "OpenClaude Contributors",
+  "license": "MIT",
+  "entry": "index.mjs",
+  "commands": [
+    {
+      "name": "template",
+      "description": "Example template command",
+      "handler": "handleTemplateCommand"
+    }
+  ],
+  "tools": [
+    {
+      "name": "template-tool",
+      "description": "Example template tool",
+      "handler": "handleTemplateTool"
+    }
+  ],
+  "config": {
+    "enabled": true,
+    "debug": false
+  }
+}
