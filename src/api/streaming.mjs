@@ -4,6 +4,7 @@
  */
 
 import { getClient } from './client.mjs'
+import { getClientForModel, stripProviderPrefix, getProviderIdForModel } from '../providers/client-factory.mjs'
 import { executeToolUse } from '../tools/executor.mjs'
 import { createMessage } from '../utils/messages.mjs'
 import { formatError } from '../utils/errors.mjs'
@@ -129,7 +130,11 @@ export async function* streamConversation(
   options,
   abortController
 ) {
-  const client = await getClient()
+  const modelId = options.model || 'claude-sonnet-4-6'
+  const providerId = getProviderIdForModel(modelId)
+  const isAnthropicProvider = providerId === 'anthropic'
+
+  const client = await getClientForModel(modelId)
   const maxRetries = options.maxRetries ?? 3
 
   // Iterative loop — avoids generator stack growth in long agentic sessions.
@@ -142,9 +147,9 @@ export async function* streamConversation(
     let shouldLoop = false
 
     try {
-    // Build API request
+    // Build API request — strip provider prefix for actual API call
     const request = {
-      model: options.model || 'claude-sonnet-4-6',
+      model: stripProviderPrefix(modelId),
       max_tokens: options.maxTokens || 8192,
       messages: currentMessages
         .filter(m => {
@@ -170,19 +175,26 @@ export async function* streamConversation(
         }),
     }
 
-    // Add system prompts if provided, with cache breakpoints (CC 2.x)
+    // Add system prompts if provided, with cache breakpoints (Anthropic only)
     if (systemPrompts && systemPrompts.length > 0) {
-      request.system = systemPrompts.map((text, i) => {
-        const block = {
-          type: 'text',
-          text: typeof text === 'string' ? text : text.text
-        }
-        // Add cache_control to the last system block for prompt caching
-        if (i === systemPrompts.length - 1) {
-          block.cache_control = { type: 'ephemeral' }
-        }
-        return block
-      })
+      if (isAnthropicProvider) {
+        request.system = systemPrompts.map((text, i) => {
+          const block = {
+            type: 'text',
+            text: typeof text === 'string' ? text : text.text
+          }
+          // Add cache_control to the last system block for prompt caching
+          if (i === systemPrompts.length - 1) {
+            block.cache_control = { type: 'ephemeral' }
+          }
+          return block
+        })
+      } else {
+        // Non-Anthropic: flatten to a plain string — the client factory handles the rest
+        request.system = systemPrompts
+          .map(t => (typeof t === 'string' ? t : t.text))
+          .join('\n')
+      }
     }
 
     // Add tools if provided and non-empty
@@ -220,8 +232,8 @@ export async function* streamConversation(
           input_schema: inputSchema,
         }
       }))
-      // Add cache_control to last tool for prompt caching
-      if (request.tools.length > 0) {
+      // Add cache_control to last tool for prompt caching (Anthropic only)
+      if (isAnthropicProvider && request.tools.length > 0) {
         request.tools[request.tools.length - 1].cache_control = { type: 'ephemeral' }
       }
     }
