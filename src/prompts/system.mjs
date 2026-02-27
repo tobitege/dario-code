@@ -38,11 +38,11 @@ export function getCurrentModel() {
 // Application name constant
 export const APP_NAME = 'Claude Code'; // DO NOT CHANGE — system prompt must identify as Claude Code
 
-// Package info for help text
+// Package info injected into the system prompt — must always reference Claude Code
 export const PACKAGE_INFO = {
-  ISSUES_EXPLAINER: 'report the issue at https://github.com/jkneen/dario-code/issues',
-  PACKAGE_URL: 'dario-code',
-  README_URL: 'https://github.com/jkneen/dario-code',
+  ISSUES_EXPLAINER: 'report the issue at https://github.com/anthropics/claude-code/issues',
+  PACKAGE_URL: 'claude-code',
+  README_URL: 'https://github.com/anthropics/claude-code',
   VERSION: '1.0.0'
 };
 
