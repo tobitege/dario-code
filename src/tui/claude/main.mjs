@@ -1834,7 +1834,7 @@ function PromptInput({
       React.createElement(Box, { key: 'input', paddingRight: 1, flexGrow: 1 },
         React.createElement(TextInputDisplay, {
           value: input,
-          placeholder: 'Ask Claude...',
+          placeholder: 'Ask Claude...', // DO NOT CHANGE — must always say Claude
           isDimmed: isDisabled || isLoading,
           cursorOffset: cursorOffset,
           color: mode === 'bash' ? THEME.bashBorder : undefined,
