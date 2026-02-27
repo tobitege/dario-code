@@ -1338,9 +1338,15 @@ function PromptInput({
     if (input.startsWith('/')) {
       // Command suggestions
       const search = input.slice(1).toLowerCase()
+      const seen = new Set()
       const matching = commands
         .filter(cmd => {
+          // Skip hidden overlay stubs — they duplicate real localCommands
+          if (cmd.isHidden) return false
           const name = cmd.userFacingName?.() || cmd.name
+          // Deduplicate by user-facing name (in case of any other duplicates)
+          if (seen.has(name)) return false
+          seen.add(name)
           return name.toLowerCase().includes(search) ||
             cmd.aliases?.some(a => a.toLowerCase().includes(search))
         })
