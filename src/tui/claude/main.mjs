@@ -771,7 +771,7 @@ Get started:
 const THEME = {
   claude: '#D97706',
   text: '#E5E5E5',
-  secondaryText: '#6B7280',
+  secondaryText: '#B0B8C4',   // was #6B7280 — lifted for readability on dark bg
   secondaryBorder: '#374151',
   success: '#22C55E',
   error: '#EF4444',

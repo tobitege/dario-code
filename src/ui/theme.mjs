@@ -58,7 +58,7 @@ export const darkTheme = {
   permission: '#b1b9f9',      // Light Blue - permission prompts
   secondaryBorder: '#888',    // Medium Gray
   text: '#fff',               // White - primary text
-  secondaryText: '#999',      // Light Gray - secondary text
+  secondaryText: '#B0B8C4',   // Readable gray on dark background (was #999)
   suggestion: '#b1b9f9',      // Light Blue - suggestions
   success: '#4eba65',         // Medium Green
   error: '#ff6b80',           // Light Red
@@ -80,7 +80,7 @@ export const darkDaltonizedTheme = {
   permission: '#99ccff',      // Sky Blue
   secondaryBorder: '#888',    // Medium Gray
   text: '#fff',               // White
-  secondaryText: '#999',      // Light Gray
+  secondaryText: '#B0B8C4',   // Readable gray on dark background (was #999)
   suggestion: '#99ccff',      // Sky Blue
   success: '#3399ff',         // Light Blue
   error: '#ff6666',           // Light Red
