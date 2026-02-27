@@ -605,7 +605,7 @@ export function StickerRequestForm({ onSubmit, onClose }) {
 |         CLASSIFIED           |
 +------------------------------+`
 
-  const secretMessage = "You've discovered Claude's top secret sticker distribution operation!"
+  const secretMessage = "You've discovered Dario's top secret sticker distribution operation!"
 
   // Render header section
   const renderHeader = () => (
@@ -705,7 +705,7 @@ export function StickerRequestForm({ onSubmit, onClose }) {
         ),
         React.createElement(Box, { flexDirection: 'column', marginY: 1 },
           React.createElement(Text, { color: theme.text },
-            'We\'re sorry, but the Claude sticker deployment mission is only available within the United States.'
+            'We\'re sorry, but the Dario sticker deployment mission is only available within the United States.'
           ),
           React.createElement(Box, { marginTop: 1 },
             React.createElement(Text, { color: theme.text },

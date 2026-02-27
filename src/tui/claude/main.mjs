@@ -430,8 +430,8 @@ const standardCommands = [
         ['help',           'Show this help message'],
         ['init',           'Create an AGENTS.md file for this project'],
         ['model',          'Switch AI models (or /model <name>)'],
-        ['login',          'Sign in to Claude (OAuth or API key)'],
-        ['logout',         'Sign out of Claude'],
+        ['login',          'Sign in to Dario'],
+        ['logout',         'Sign out of Dario'],
         ['auth',           'Show authentication status'],
         ['status',         'Show project and session status'],
         ['cost',           'Show API usage and cost for this session'],
@@ -457,7 +457,7 @@ const standardCommands = [
         ['terminal-setup', 'Configure shell integration'],
         ['bug',            'Report a bug'],
         ['version',        'Show version information'],
-        ['quit',           'Exit Claude'],
+        ['quit',           'Exit Dario'],
       ]
 
       const maxCmd = Math.max(...commandHelp.map(([c]) => c.length))
@@ -465,7 +465,7 @@ const standardCommands = [
         `  /${cmd.padEnd(maxCmd + 1)} ${desc}`
       ).join('\n')
 
-      return `Claude Help
+      return `Dario Help
 ${'─'.repeat(56)}
 
 Commands:
@@ -478,7 +478,7 @@ Keyboard shortcuts:
   Ctrl+C     Exit (or clear input)
 
 Get started:
-  Ask Claude questions about your codebase
+  Ask Dario questions about your codebase
   Use @filename to reference files
   Use ! prefix for bash commands`
     }
@@ -486,7 +486,7 @@ Get started:
   {
     name: 'quit',
     aliases: ['exit', 'q'],
-    description: 'Exit Claude',
+    description: 'Exit Dario',
     isEnabled: true,
     userFacingName() { return 'quit' },
     async call() {
@@ -500,7 +500,7 @@ Get started:
     isEnabled: true,
     userFacingName() { return 'version' },
     async call() {
-      return `Claude v${VERSION || '1.0.0'}`
+      return `Dario v${VERSION || '1.0.0'}`
     }
   },
   // Overlay wrappers — these show interactive TUI overlays when called without args,
@@ -525,7 +525,7 @@ Get started:
   },
   {
     name: 'login-overlay',
-    description: 'Sign in to Claude (interactive)',
+    description: 'Sign in to Dario',
     isEnabled: true,
     isOverlay: true,
     isHidden: true,
@@ -869,7 +869,7 @@ function WelcomeBanner({ mcpClients = [], isDefaultModel = true }) {
       React.createElement(Text, { key: 'title' },
         React.createElement(Text, { color: THEME.claude }, '✻'),
         ' Welcome to ',
-        React.createElement(Text, { bold: true }, 'Claude'),
+        React.createElement(Text, { bold: true }, 'Dario'),
         React.createElement(Text, null, '!')
       ),
       React.createElement(Box, {
@@ -931,13 +931,13 @@ function WorkspaceTips({ workspaceDir }) {
     React.createElement(Box, { key: 'tips', flexDirection: 'column', paddingLeft: 2 },
       React.createElement(Text, { key: 'tip1', color: THEME.secondaryText },
         '• Run ', React.createElement(Text, { color: THEME.text }, '/init'),
-        ' to create an AGENTS.md file with instructions for Claude.'
+        ' to create an AGENTS.md file with instructions for Dario.'
       ),
       React.createElement(Text, { key: 'tip2', color: THEME.secondaryText },
-        '• Ask Claude questions about your codebase.'
+        '• Ask Dario questions about your codebase.'
       ),
       React.createElement(Text, { key: 'tip3', color: THEME.secondaryText },
-        '• Ask Claude to implement changes to your codebase.'
+        '• Ask Dario to implement changes to your codebase.'
       )
     )
   )

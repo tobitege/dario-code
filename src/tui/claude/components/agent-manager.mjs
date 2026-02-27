@@ -646,7 +646,7 @@ export function AgentManager({ tools: allTools = [], onCancel, onMessage, onDele
 
   function renderCreateMethod() {
     const options = [
-      { label: '1. Generate with Claude (recommended)', value: 'generate' },
+      { label: '1. Generate with Dario (recommended)', value: 'generate' },
       { label: '2. Manual configuration', value: 'manual' },
     ]
 

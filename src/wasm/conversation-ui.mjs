@@ -34,7 +34,7 @@ export async function createConversationUI(conversation, sendMessage) {
   // Add header title
   const headerTitle = renderer.createComponent('text', {
     id: 'headerTitle',
-    text: 'Open Claude',
+    text: 'Open Dario',
     style: {
       color: 'white',
       fontWeight: 'bold',
