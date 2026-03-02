@@ -81,6 +81,144 @@ async function resolveLocalModelId(providerEntry, baseURL, apiKey, requestedMode
   return latest || prefixMatches[0]
 }
 
+/**
+ * Convert Anthropic-format messages to OpenAI-format messages.
+ * Handles text, tool_use (→ assistant tool_calls), and tool_result (→ tool role).
+ */
+function convertMessagesToOpenAI(anthropicRequest) {
+  const messages = []
+
+  // System prompt
+  if (anthropicRequest.system) {
+    const systemText = Array.isArray(anthropicRequest.system)
+      ? anthropicRequest.system.map(b => (typeof b === 'string' ? b : b.text)).join('\n')
+      : anthropicRequest.system
+    messages.push({ role: 'system', content: systemText })
+  }
+
+  for (const msg of anthropicRequest.messages) {
+    if (typeof msg.content === 'string') {
+      messages.push({ role: msg.role, content: msg.content })
+      continue
+    }
+
+    if (!Array.isArray(msg.content)) continue
+
+    if (msg.role === 'assistant') {
+      // Collect text parts + tool_use blocks separately
+      const textParts = []
+      const toolCalls = []
+
+      for (const block of msg.content) {
+        if (block.type === 'text' && block.text) {
+          textParts.push(block.text)
+        } else if (block.type === 'tool_use') {
+          toolCalls.push({
+            id: block.id || `call_${Date.now()}_${toolCalls.length}`,
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.input || {}),
+            },
+          })
+        }
+      }
+
+      const assistantMsg = { role: 'assistant', content: textParts.join('\n') || null }
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls
+      messages.push(assistantMsg)
+    } else if (msg.role === 'user') {
+      // tool_result blocks → individual 'tool' role messages
+      // other blocks → user text message
+      const toolResults = msg.content.filter(b => b.type === 'tool_result')
+      const otherBlocks = msg.content.filter(b => b.type !== 'tool_result')
+
+      for (const result of toolResults) {
+        const content = typeof result.content === 'string'
+          ? result.content
+          : Array.isArray(result.content)
+            ? result.content.map(c => (typeof c === 'string' ? c : c.text || JSON.stringify(c))).join('\n')
+            : JSON.stringify(result.content ?? '')
+        messages.push({
+          role: 'tool',
+          tool_call_id: result.tool_use_id,
+          content,
+        })
+      }
+
+      if (otherBlocks.length > 0) {
+        const textContent = otherBlocks
+          .map(b => (b.type === 'text' ? b.text : ''))
+          .join('\n')
+          .trim()
+        if (textContent) messages.push({ role: 'user', content: textContent })
+      }
+    }
+  }
+
+  return messages
+}
+
+/**
+ * Convert Anthropic tool definitions to OpenAI function tool format.
+ */
+function convertToolsToOpenAI(anthropicTools) {
+  if (!anthropicTools || anthropicTools.length === 0) return []
+
+  return anthropicTools.map(tool => {
+    // Strip Anthropic-only fields like cache_control from the schema
+    const schema = { ...(tool.input_schema || { type: 'object', properties: {} }) }
+    delete schema.cache_control
+
+    return {
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description || '',
+        parameters: schema,
+      },
+    }
+  })
+}
+
+/**
+ * Parse XML-style tool calls emitted by some models (e.g. Qwen) as plain text.
+ * Supports:
+ *   <tool_call>{"name":"foo","arguments":{...}}</tool_call>
+ *   <tool_call>{"name":"foo","parameters":{...}}</tool_call>
+ *
+ * Returns { textBefore, calls: [{name, args}], textAfter } or null if none found.
+ */
+function parseXmlToolCalls(text) {
+  const xmlPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g
+  const calls = []
+  let lastIndex = 0
+  let firstMatchIndex = -1
+  let lastMatchEnd = 0
+  let match
+
+  while ((match = xmlPattern.exec(text)) !== null) {
+    if (firstMatchIndex === -1) firstMatchIndex = match.index
+    lastMatchEnd = match.index + match[0].length
+    try {
+      const parsed = JSON.parse(match[1])
+      const name = parsed.name
+      const args = parsed.arguments ?? parsed.parameters ?? parsed.input ?? {}
+      if (name) calls.push({ name, args })
+    } catch {
+      // Ignore malformed blocks
+    }
+  }
+
+  if (calls.length === 0) return null
+
+  return {
+    textBefore: text.slice(0, firstMatchIndex).trim(),
+    calls,
+    textAfter: text.slice(lastMatchEnd).trim(),
+  }
+}
+
 function buildOpenAICompatClient(providerEntry) {
   const baseURL = providerEntry.baseURL.replace(/\/$/, '')
   const apiKey = providerEntry.apiKey
@@ -89,54 +227,23 @@ function buildOpenAICompatClient(providerEntry) {
     messages: {
       /**
        * Stream a chat completion request.
-       * Converts Anthropic-style request to OpenAI Chat format.
+       * Converts Anthropic-style request to OpenAI Chat format (including tools).
        * Returns an async iterable that yields Anthropic-compatible SSE events.
+       *
+       * Handles three tool-call response styles:
+       *  1. Standard OpenAI delta.tool_calls (preferred)
+       *  2. XML <tool_call>…</tool_call> in text (Qwen fallback)
+       *  3. Plain text only (no tools)
        */
       stream(anthropicRequest, { signal } = {}) {
-        // Convert Anthropic messages format to OpenAI format
-        const messages = []
-
-        // Add system prompt(s) as a system message
-        if (anthropicRequest.system) {
-          const systemText = Array.isArray(anthropicRequest.system)
-            ? anthropicRequest.system.map(b => (typeof b === 'string' ? b : b.text)).join('\n')
-            : anthropicRequest.system
-          messages.push({ role: 'system', content: systemText })
-        }
-
-        for (const msg of anthropicRequest.messages) {
-          if (typeof msg.content === 'string') {
-            messages.push({ role: msg.role, content: msg.content })
-          } else if (Array.isArray(msg.content)) {
-            // Flatten content blocks to text (tool results → text)
-            const parts = msg.content.map(block => {
-              if (block.type === 'text') return { type: 'text', text: block.text }
-              if (block.type === 'tool_use') {
-                return {
-                  type: 'text',
-                  text: `[Tool call: ${block.name}(${JSON.stringify(block.input)})]`,
-                }
-              }
-              if (block.type === 'tool_result') {
-                const content = typeof block.content === 'string'
-                  ? block.content
-                  : JSON.stringify(block.content)
-                return { type: 'text', text: `[Tool result: ${content}]` }
-              }
-              return { type: 'text', text: '' }
-            })
-
-            const textContent = parts.map(p => p.text).join('\n').trim()
-            messages.push({ role: msg.role, content: textContent })
-          }
-        }
+        const messages = convertMessagesToOpenAI(anthropicRequest)
+        const openAITools = convertToolsToOpenAI(anthropicRequest.tools)
 
         // Return async iterable that yields Anthropic-compatible events
         return {
           [Symbol.asyncIterator]() {
             let buffer = ''
             let reader = null
-            let done = false
             let messageId = null
             let inputTokens = 0
             let outputTokens = 0
@@ -156,12 +263,13 @@ function buildOpenAICompatClient(providerEntry) {
                 stream: true,
               }
 
-              const headers = {
-                'Content-Type': 'application/json',
+              if (openAITools.length > 0) {
+                openAIBody.tools = openAITools
+                openAIBody.tool_choice = 'auto'
               }
-              if (apiKey) {
-                headers.Authorization = `Bearer ${apiKey}`
-              }
+
+              const headers = { 'Content-Type': 'application/json' }
+              if (apiKey) headers.Authorization = `Bearer ${apiKey}`
 
               const response = await fetch(`${baseURL}/chat/completions`, {
                 method: 'POST',
@@ -187,15 +295,17 @@ function buildOpenAICompatClient(providerEntry) {
                 },
               }
 
-              yield {
-                type: 'content_block_start',
-                index: 0,
-                content_block: { type: 'text', text: '' },
-              }
+              // --- Streaming state ---
+              // Text block: index 0
+              // Tool blocks: index 1, 2, … (one per tool call)
+              let textBlockStarted = false
+              let accumulatedText = ''
+              // Map: openAI tool_call index → { blockIndex, id, name, argsJson }
+              const toolCallMap = new Map()
+              let nextBlockIndex = 0
 
               const textDecoder = new TextDecoder()
               reader = response.body.getReader()
-              let chunkIndex = 0
 
               while (true) {
                 const { value, done: streamDone } = await reader.read()
@@ -208,28 +318,70 @@ function buildOpenAICompatClient(providerEntry) {
                 for (const line of lines) {
                   if (!line.startsWith('data: ')) continue
                   const data = line.slice(6).trim()
-                  if (data === '[DONE]') {
-                    done = true
-                    continue
-                  }
+                  if (data === '[DONE]') continue
 
                   let chunk
-                  try {
-                    chunk = JSON.parse(data)
-                  } catch {
-                    continue
-                  }
+                  try { chunk = JSON.parse(data) } catch { continue }
 
-                  // Extract delta text
-                  const delta = chunk.choices?.[0]?.delta?.content
-                  if (delta) {
+                  const delta = chunk.choices?.[0]?.delta
+
+                  // --- Text content ---
+                  if (delta?.content) {
+                    accumulatedText += delta.content
+                    if (!textBlockStarted) {
+                      textBlockStarted = true
+                      nextBlockIndex = 0
+                      yield {
+                        type: 'content_block_start',
+                        index: 0,
+                        content_block: { type: 'text', text: '' },
+                      }
+                    }
                     outputTokens++
                     yield {
                       type: 'content_block_delta',
                       index: 0,
-                      delta: { type: 'text_delta', text: delta },
+                      delta: { type: 'text_delta', text: delta.content },
                     }
-                    chunkIndex++
+                  }
+
+                  // --- OpenAI-style tool_calls deltas ---
+                  if (delta?.tool_calls) {
+                    for (const tc of delta.tool_calls) {
+                      const tcIdx = tc.index ?? 0
+
+                      if (!toolCallMap.has(tcIdx)) {
+                        // New tool call — start a tool_use block
+                        const blockIndex = nextBlockIndex + 1
+                        nextBlockIndex = blockIndex
+                        const callId = tc.id || `call_${Date.now()}_${tcIdx}`
+                        const callName = tc.function?.name || ''
+                        toolCallMap.set(tcIdx, { blockIndex, id: callId, name: callName, argsJson: '' })
+
+                        yield {
+                          type: 'content_block_start',
+                          index: blockIndex,
+                          content_block: { type: 'tool_use', id: callId, name: callName, input: {} },
+                        }
+                      }
+
+                      const entry = toolCallMap.get(tcIdx)
+
+                      // Update name if we get it late
+                      if (tc.function?.name && !entry.name) entry.name = tc.function.name
+                      if (tc.id && !entry.id) entry.id = tc.id
+
+                      // Accumulate argument JSON fragments
+                      if (tc.function?.arguments) {
+                        entry.argsJson += tc.function.arguments
+                        outputTokens++
+                        yield {
+                          type: 'content_block_delta',
+                          index: entry.blockIndex,
+                          delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
+                        }
+                      }
+                    }
                   }
 
                   // Capture usage if provided
@@ -240,32 +392,87 @@ function buildOpenAICompatClient(providerEntry) {
                 }
               }
 
-              yield { type: 'content_block_stop', index: 0 }
+              // --- Post-stream: handle XML tool calls embedded in text ---
+              if (toolCallMap.size === 0 && accumulatedText) {
+                const xmlResult = parseXmlToolCalls(accumulatedText)
+                if (xmlResult && xmlResult.calls.length > 0) {
+                  // We need to rewind the text block and re-emit only textBefore
+                  // Since we already streamed the text, close that block and emit tool_use blocks
+
+                  // Close text block (already started above)
+                  if (textBlockStarted) {
+                    yield { type: 'content_block_stop', index: 0 }
+                    textBlockStarted = false
+                  }
+
+                  // Emit tool_use blocks for each XML call
+                  for (let i = 0; i < xmlResult.calls.length; i++) {
+                    const { name, args } = xmlResult.calls[i]
+                    const blockIndex = i + 1
+                    const callId = `call_xml_${Date.now()}_${i}`
+                    const argsJson = JSON.stringify(args)
+
+                    yield {
+                      type: 'content_block_start',
+                      index: blockIndex,
+                      content_block: { type: 'tool_use', id: callId, name, input: {} },
+                    }
+                    yield {
+                      type: 'content_block_delta',
+                      index: blockIndex,
+                      delta: { type: 'input_json_delta', partial_json: argsJson },
+                    }
+                    yield { type: 'content_block_stop', index: blockIndex }
+                  }
+
+                  yield {
+                    type: 'message_delta',
+                    delta: { stop_reason: 'tool_use' },
+                    usage: { output_tokens: outputTokens },
+                  }
+                  yield {
+                    type: 'message_stop',
+                    message: { id: messageId, usage: { input_tokens: inputTokens, output_tokens: outputTokens } },
+                  }
+                  return
+                }
+              }
+
+              // --- Close all open blocks ---
+              if (textBlockStarted) {
+                yield { type: 'content_block_stop', index: 0 }
+              } else if (toolCallMap.size === 0) {
+                // No content at all — emit an empty text block so the caller has something
+                yield {
+                  type: 'content_block_start',
+                  index: 0,
+                  content_block: { type: 'text', text: '' },
+                }
+                yield { type: 'content_block_stop', index: 0 }
+              }
+
+              for (const { blockIndex } of toolCallMap.values()) {
+                yield { type: 'content_block_stop', index: blockIndex }
+              }
+
+              const stopReason = toolCallMap.size > 0 ? 'tool_use' : 'end_turn'
 
               yield {
                 type: 'message_delta',
-                delta: { stop_reason: 'end_turn' },
+                delta: { stop_reason: stopReason },
                 usage: { output_tokens: outputTokens },
               }
 
               yield {
                 type: 'message_stop',
-                message: {
-                  id: messageId,
-                  usage: {
-                    input_tokens: inputTokens,
-                    output_tokens: outputTokens,
-                  },
-                },
+                message: { id: messageId, usage: { input_tokens: inputTokens, output_tokens: outputTokens } },
               }
             }
 
             const gen = fetchStream()
 
             return {
-              async next() {
-                return gen.next()
-              },
+              async next() { return gen.next() },
               [Symbol.asyncIterator]() { return this },
             }
           },
