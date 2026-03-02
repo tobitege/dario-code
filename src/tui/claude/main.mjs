@@ -541,6 +541,8 @@ const standardCommands = [
         ['tools',          'Manage tool modes (always/ask/auto/off)'],
         ['vim',            'Toggle vim keybindings'],
         ['terminal-setup', 'Configure shell integration'],
+        ['simplify',       'Simplify recently changed code (optional focus area)'],
+        ['batch',          'Queue prompts sequentially: add <prompt> | run | list | clear'],
         ['bug',            'Report a bug'],
         ['version',        'Show version information'],
         ['quit',           'Exit Dario'],
@@ -2784,7 +2786,7 @@ function ConversationApp({
             showToolsManager: () => setShowToolsManager(true),
             showContextManager: () => openContextManager(),
             showSteeringQuestions: (data) => openSteeringQuestions(data),
-            submitMessage: (text) => setTimeout(() => handleSubmit(text), 50),
+            submitMessage: (text) => setTimeout(() => handleQuery(text), 50),
           })
 
           // Handle command result

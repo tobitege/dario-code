@@ -2662,6 +2662,8 @@ export function getLocalCommands() {
     reviewCommand,
     prCommentsCommand,
     providersCommand,
+    simplifyCommand,
+    batchCommand,
   ]
 }
 
