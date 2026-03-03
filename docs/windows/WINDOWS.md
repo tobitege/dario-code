@@ -130,6 +130,68 @@ Typical installed paths:
 - `C:\Program Files\Git\bin\bash.exe`
 - `C:\Program Files\Git\usr\bin\bash.exe`
 
+### 7. Repeatable setup with a local `winget-win-tools.json`
+
+If you work on this project on multiple Windows machines, a local `winget-win-tools.json` is the most practical way to keep tool setup consistent.
+
+Why use this approach:
+
+- Repeatable setup: same tool IDs can be installed again after a machine reset.
+- Clear audit trail: the exact package identifiers are visible in one file.
+- Local only: the file stays on your machine unless you decide to share it.
+- No custom packaging: you are not creating or publishing any `winget` package.
+
+Tool IDs to include for this repository:
+
+- `Git.Git` (Git + Git Bash used by shell execution and Git features)
+- `BurntSushi.ripgrep.MSVC` (`rg` used by Grep tool and related tests)
+- `GitHub.cli` (`gh` used by `/pr-comments`)
+- `ChrisBagwell.SoX` (`sox`/`rec` used by voice recording)
+
+Canonical file in this repository:
+
+- `docs/windows/winget-win-tools.json`
+
+Install these directly:
+
+```powershell
+winget install --id Git.Git --exact
+winget install --id BurntSushi.ripgrep.MSVC --exact
+winget install --id GitHub.cli --exact
+winget install --id ChrisBagwell.SoX --exact
+```
+
+Then export your local install set:
+
+```powershell
+winget export -o winget-win-tools.json
+```
+
+Note: `winget export` captures your installed package set. If you want a minimal file for this repo, keep only the four IDs listed above in that JSON.
+
+Restore later on another Windows machine:
+
+```powershell
+winget import -i docs/windows/winget-win-tools.json
+```
+
+Why `winget` is generally a safe source:
+
+- `winget` client is maintained by Microsoft.
+- Package manifests are public in the open-source `winget-pkgs` repository.
+- Manifests are reviewed, and package installers are hash-validated during install.
+
+Why this is only "mostly" safe:
+
+- Trust still depends on the original software publisher and download endpoint.
+- A compromised upstream installer is still a risk in any package manager.
+
+Recommended safety checks:
+
+- Use `--exact` and explicit IDs to avoid accidental package mismatches.
+- Check package details before install: `winget show --id <ID> --exact`.
+- Keep Windows Defender and SmartScreen enabled.
+
 ## Behavior differences on Windows
 
 ### Bash tool behavior depends on available shell
