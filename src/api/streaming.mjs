@@ -167,6 +167,7 @@ export async function* streamConversation(
             content = content.map(block => {
               const cleaned = { ...block }
               delete cleaned._partialJson
+              delete cleaned.data
               return cleaned
             })
           }
@@ -419,6 +420,7 @@ export async function* streamConversation(
             tool_use_id: toolUse.id,
             content: result.content,
             is_error: result.is_error || false,
+            data: result.data,
           })
 
           // Yield progress

@@ -251,6 +251,7 @@ export function createWriteTool(dependencies) {
           type: 'update',
           filePath: file_path,
           content,
+          oldContent: originalContent,
           structuredPatch: patch
         }
 

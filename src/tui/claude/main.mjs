@@ -27,6 +27,8 @@ import { execFileSync } from 'child_process'
 import { authenticateWithOAuth, getAuthInfo, logout as oauthLogout, getValidToken, setOAuthMode } from '../../auth/oauth.mjs'
 import { resetClient } from '../../api/client.mjs'
 import { getSystemPromptIntro, getSystemInstructions } from '../../prompts/system.mjs'
+import { renderMarkdown } from './components/markdown.mjs'
+import { generateDiff } from '../../utils/diff.mjs'
 import { FastModeToggle } from './components/fast-mode-toggle.mjs'
 import { PromptFooter } from './components/prompt-footer.mjs'
 import { McpManager } from './components/mcp-manager.mjs'
@@ -1425,6 +1427,7 @@ function AssistantContentRenderer({
       const segments = parseInsightBlocks(param.text)
       // Fast path: no insight blocks — render as before
       if (segments.length === 1 && segments[0].type === 'text') {
+        const rendered = renderMarkdown(param.text)
         return React.createElement(Box, {
           flexDirection: 'column',
           marginTop: addMargin ? 1 : 0,
@@ -1432,7 +1435,7 @@ function AssistantContentRenderer({
         },
           React.createElement(Text, null,
             shouldShowDot && React.createElement(Text, { color: THEME.claude }, '● '),  
-            param.text
+            rendered
           )
         )
       }
@@ -1447,7 +1450,7 @@ function AssistantContentRenderer({
             : React.createElement(Box, { key: idx, marginLeft: 2 },
                 React.createElement(Text, null,
                   idx === 0 && shouldShowDot && React.createElement(Text, { color: THEME.claude }, '● '),  
-                  seg.content
+                  renderMarkdown(seg.content)
                 )
               )
         )
@@ -1480,6 +1483,34 @@ function AssistantContentRenderer({
 }
 
 /**
+ * Inline Diff Block — renders colored diff lines from oldText/newText
+ */
+function DiffBlock({ oldText, newText, filename }) {
+  const diffLines = useMemo(
+    () => generateDiff(oldText, newText, filename),
+    [oldText, newText, filename]
+  )
+  if (!diffLines || diffLines.length === 0) return null
+
+  return React.createElement(Box, { flexDirection: 'column' },
+    diffLines.map((d, i) => {
+      switch (d.type) {
+        case 'header':
+          return React.createElement(Text, { key: i, color: THEME.secondaryText, dimColor: true }, d.line)
+        case 'add':
+          return React.createElement(Text, { key: i, color: THEME.success }, '+ ', d.line)
+        case 'remove':
+          return React.createElement(Text, { key: i, color: THEME.error }, '- ', d.line)
+        case 'context':
+          return React.createElement(Text, { key: i, dimColor: true }, '  ', d.line)
+        default:
+          return null
+      }
+    })
+  )
+}
+
+/**
  * User Content Renderer
  */
 function UserContentRenderer({ param, message, messages, tools, verbose, addMargin, expandedToolResults = new Set() }) {
@@ -1508,6 +1539,44 @@ function UserContentRenderer({ param, message, messages, tools, verbose, addMarg
 
     case 'tool_result': {
       const isError = param.is_error
+      const data = param.data
+      // Inline diff for Edit tool (has oldString/newString)
+      if (!isError && data?.oldString !== undefined && data?.newString !== undefined && data.oldString !== data.newString) {
+        const displayFile = data.filePath || 'file'
+        return React.createElement(Box, { flexDirection: 'column', marginLeft: 4 },
+          React.createElement(Text, { color: THEME.secondaryText }, '⎿ ', `Updated ${displayFile}`),
+          React.createElement(DiffBlock, {
+            oldText: data.oldString,
+            newText: data.newString,
+            filename: displayFile,
+
+          })
+        )
+      }
+
+      // Inline diff for Write tool updates (has oldContent + content)
+      if (!isError && data?.type === 'update' && data?.oldContent && data?.content) {
+        const displayFile = data.filePath || 'file'
+        return React.createElement(Box, { flexDirection: 'column', marginLeft: 4 },
+          React.createElement(Text, { color: THEME.secondaryText }, '⎿ ', `Updated ${displayFile}`),
+          React.createElement(DiffBlock, {
+            oldText: data.oldContent,
+            newText: data.content,
+            filename: displayFile,
+
+          })
+        )
+      }
+
+      // Write tool creates — just show creation notice
+      if (!isError && data?.type === 'create' && data?.filePath) {
+        const lineCount = (data.content || '').split('\n').length
+        return React.createElement(Box, { flexDirection: 'column', marginLeft: 4 },
+          React.createElement(Text, { color: THEME.secondaryText }, '⎿ ', `Created ${data.filePath} (${lineCount} lines)`)
+        )
+      }
+
+      // Fallback: plain text rendering (original behavior)
       const content = typeof param.content === 'string'
         ? param.content
         : JSON.stringify(param.content)
@@ -3346,15 +3415,40 @@ function ConversationApp({
     [messages]
   )
 
+  // Find the index of the most recent tool_result message so it can be rendered
+  // dynamically (outside Static), allowing Ctrl+O expand/collapse to work.
+  const lastToolResultIdx = useMemo(() => {
+    for (let i = normalizedMessages.length - 1; i >= 0; i--) {
+      const msg = normalizedMessages[i]
+      if (
+        msg.type === 'user' &&
+        Array.isArray(msg.message?.content) &&
+        msg.message.content.some(c => c.type === 'tool_result')
+      ) {
+        return i
+      }
+    }
+    return -1
+  }, [normalizedMessages])
+
   // Split messages: all-but-last go into Static (rendered once, no re-render),
   // last message stays dynamic so streaming updates render without flashing the whole TUI.
-  const staticMessages = isLoading
-    ? normalizedMessages.slice(0, -1)
-    : normalizedMessages
+  // Also keep the most recent tool_result message (and its preceding tool_use) dynamic
+  // so Ctrl+O expand/collapse can re-render it.
+  const dynamicStartIdx = isLoading
+    ? normalizedMessages.length - 1
+    : (lastToolResultIdx >= 0 ? lastToolResultIdx - 1 : normalizedMessages.length)
+
+  const staticMessages = normalizedMessages.slice(0, Math.max(0, dynamicStartIdx))
 
   const liveMessage = isLoading && normalizedMessages.length > 0
     ? normalizedMessages[normalizedMessages.length - 1]
     : null
+
+  // Messages rendered dynamically (after Static): tool_use + tool_result pair (when not loading)
+  const dynamicMessages = !isLoading && lastToolResultIdx >= 0
+    ? normalizedMessages.slice(Math.max(0, dynamicStartIdx))
+    : []
 
   // Static items: header + completed messages
   // IMPORTANT: Ink's Static component re-renders ALL items when the items array
@@ -3366,7 +3460,7 @@ function ConversationApp({
   const staticConfigRef = useRef(null)
 
   const staticItems = useMemo(() => {
-    const configKey = `${forkNumber}-${effectiveVerbose}-${debug}-${isDefaultModel}-${currentModel}-${expandedToolResults.size}`
+    const configKey = `${forkNumber}-${effectiveVerbose}-${debug}-${isDefaultModel}-${currentModel}`
     const newLen = 1 + staticMessages.length // header + messages
 
     // If item count and config haven't changed, return the same array reference
@@ -3416,12 +3510,29 @@ function ConversationApp({
     staticItemsLenRef.current = newLen
     staticConfigRef.current = configKey
     return items
-  }, [forkNumber, staticMessages, effectiveVerbose, debug, mcpClients, isDefaultModel, currentModel, expandedToolResults])
+  }, [forkNumber, staticMessages, effectiveVerbose, debug, mcpClients, isDefaultModel, currentModel])
 
   return React.createElement(Box, { flexDirection: 'column' },
     // Static messages — rendered once, never re-rendered (prevents flash)
     React.createElement(Static, { items: staticItems },
       (item) => React.createElement(React.Fragment, { key: item.key }, item.jsx)
+    ),
+
+    // Dynamic messages — most recent tool_use+tool_result pair rendered outside Static
+    // so Ctrl+O expand/collapse state changes can re-render them
+    ...dynamicMessages.map((msg, idx) =>
+      React.createElement(Box, { key: msg.uuid || `dyn-${idx}`, width: '100%' },
+        React.createElement(MessageRenderer, {
+          message: msg,
+          messages: normalizedMessages,
+          tools,
+          verbose: effectiveVerbose,
+          debug,
+          addMargin: true,
+          shouldShowDot: true,
+          expandedToolResults,
+        })
+      )
     ),
 
     // Live (streaming) message — updates without touching Static items
