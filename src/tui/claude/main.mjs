@@ -55,6 +55,8 @@ import { getTotalContextTokens } from '../../utils/tokens.mjs'
 import * as sessions from '../../sessions/index.mjs'
 import { onPlanApproved } from '../../plan/plan.mjs'
 import { startSkillsHotReload, stopSkillsHotReload, onSkillsChanged, invalidateSkillsCache } from '../../tools/skills-discovery.mjs'
+import { VoiceSession } from '../../voice/index.mjs'
+import { keyboardManager } from '../../keyboard/index.mjs'
 
 /**
  * Error Boundary - Catches React errors and displays them gracefully
@@ -1442,6 +1444,52 @@ function PromptInput({
   const [thinkingVisible, setThinkingVisible] = useState(false)
   const thinkingTimeoutRef = useRef(null)
 
+  // Voice mode state
+  const [voiceStatus, setVoiceStatus] = useState(null)   // 'recording' | 'transcribing' | null
+  const voiceSessionRef = useRef(null)
+  const voiceReleaseTimerRef = useRef(null)
+  const voiceHoldingRef = useRef(false)
+  const voiceSpaceCountRef = useRef(0)
+
+  // Voice start/stop handlers (called from useInput space-hold detection)
+  const handleVoiceStart = useCallback(() => {
+    if (voiceSessionRef.current) return
+
+    const session = new VoiceSession()
+    voiceSessionRef.current = session
+
+    session.on('recording', () => {
+      setVoiceStatus('recording')
+    })
+    session.on('transcribing', () => {
+      setVoiceStatus('transcribing')
+    })
+    session.on('transcribed', (text) => {
+      setVoiceStatus(null)
+      voiceSessionRef.current = null
+      if (text) onQuery(text)
+    })
+    session.on('error', () => {
+      setVoiceStatus(null)
+      voiceSessionRef.current = null
+    })
+
+    session.start()
+  }, [onQuery])
+
+  const handleVoiceStop = useCallback(() => {
+    if (voiceSessionRef.current) {
+      voiceSessionRef.current.stop()
+    }
+  }, [])
+
+  // Cleanup release timer on unmount
+  useEffect(() => {
+    return () => {
+      if (voiceReleaseTimerRef.current) clearTimeout(voiceReleaseTimerRef.current)
+    }
+  }, [])
+
   // Suggestions state
   const [suggestions, setSuggestions] = useState([])
   const [selectedSuggestion, setSelectedSuggestion] = useState(0)
@@ -1452,9 +1500,10 @@ function PromptInput({
   const cursorOffsetRef = useRef(input.length)
   const [cursorOffset, _setCursorOffset] = useState(input.length)
 
-  // Keep inputRef in sync with prop
+  // Keep inputRef in sync with prop + notify keyboardManager for voice mode
   useEffect(() => {
     inputRef.current = input
+    keyboardManager.setCurrentInput(input)
   }, [input])
 
   const setCursorOffset = useCallback((val) => {
@@ -1934,6 +1983,29 @@ function PromptInput({
       const charCode = char.charCodeAt(0)
       if (charCode < 32 && charCode !== 10) return // Skip control chars except newline
 
+      // Voice mode: space-hold detection when input is empty
+      // macOS has ~300-500ms delay before key repeat starts, then ~30ms between repeats.
+      // Use a longer timeout for the first space, shorter once repeat stream is confirmed.
+      if (keyboardManager.voiceMode && char === ' ' && !inputRef.current) {
+        if (!voiceHoldingRef.current) {
+          voiceHoldingRef.current = true
+          voiceSpaceCountRef.current = 1
+          handleVoiceStart()
+        } else {
+          voiceSpaceCountRef.current++
+        }
+        if (voiceReleaseTimerRef.current) clearTimeout(voiceReleaseTimerRef.current)
+        // First space: 500ms survives the pre-repeat delay. Once repeating: 150ms.
+        const timeout = voiceSpaceCountRef.current <= 1 ? 500 : 150
+        voiceReleaseTimerRef.current = setTimeout(() => {
+          voiceHoldingRef.current = false
+          voiceSpaceCountRef.current = 0
+          voiceReleaseTimerRef.current = null
+          handleVoiceStop()
+        }, timeout)
+        return
+      }
+
       // Typing refocuses to input
       if (attachmentFocusIndex >= 0) setAttachmentFocusIndex(-1)
 
@@ -2002,14 +2074,20 @@ function PromptInput({
           ? React.createElement(Text, { key: 'bash', color: THEME.bashBorder }, ' ! ')
           : React.createElement(Text, { key: 'normal', color: isLoading ? THEME.secondaryText : undefined }, ' > ')
       ),
-      // Text input display
+      // Text input display (voice status shown as placeholder to avoid layout shift)
       React.createElement(Box, { key: 'input', paddingRight: 1, flexGrow: 1 },
         React.createElement(TextInputDisplay, {
           value: input,
-          placeholder: 'Ask Dario...',
+          placeholder: voiceStatus === 'recording'
+            ? '● Recording... (release Space to stop)'
+            : voiceStatus === 'transcribing'
+              ? '⏳ Transcribing...'
+              : keyboardManager.voiceMode && !input
+                ? 'Hold Space to speak...'
+                : 'Ask Dario...',
           isDimmed: isDisabled || isLoading,
           cursorOffset: cursorOffset,
-          color: mode === 'bash' ? THEME.bashBorder : undefined,
+          color: voiceStatus === 'recording' ? 'red' : mode === 'bash' ? THEME.bashBorder : undefined,
         })
       )
     ),
@@ -3419,6 +3497,7 @@ function ConversationApp({
             session: currentSession,
             prNumber: initialPrNumber,
             contextPercent: contextPercent,
+            voiceMode: keyboardManager.voiceMode,
           })
         : null
     )

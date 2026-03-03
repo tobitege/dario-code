@@ -1240,6 +1240,10 @@ const COMMANDS = {
     description: 'Toggle vim keybindings',
     handler: (input) => vimCommand.call(null, { args: input.slice('/vim'.length).trim().split(/\s+/) })
   },
+  voice: {
+    description: 'Hold Space to speak (toggle voice mode)',
+    handler: (input) => voiceCommand.call(null, { args: input.slice('/voice'.length).trim().split(/\s+/).filter(Boolean) })
+  },
   'terminal-setup': {
     description: 'Configure shell integration',
     handler: () => terminalSetupCommand.call()
@@ -2205,6 +2209,56 @@ export const vimCommand = {
 }
 
 // ============================================================================
+// /voice command - Hold Space to speak
+// ============================================================================
+
+import { isAvailable as isSoxAvailable } from '../voice/recorder.mjs'
+import { resolveProvider as resolveSTTProvider, resolveProviderAsync } from '../voice/transcribe.mjs'
+import { keyboardManager } from '../keyboard/index.mjs'
+
+export const voiceCommand = {
+  type: 'local',
+  name: 'voice',
+  description: 'Hold Space to speak (toggle voice mode)',
+  argumentHint: '[on|off]',
+  isEnabled: true,
+  userFacingName() { return 'voice' },
+
+  async call(closeOverlay, context) {
+    const arg = context?.args?.[0]?.toLowerCase()
+
+    // Status check helpers
+    const soxOk = isSoxAvailable()
+    const provider = await resolveProviderAsync()
+
+    if (arg === 'on') {
+      if (!soxOk) return '✗ sox not found. Install it: brew install sox (macOS) or apt install sox (Linux)'
+      if (!provider) return '✗ No STT API key. Set GROQ_API_KEY (recommended) or OPENAI_API_KEY.'
+      keyboardManager.enableVoiceMode()
+      return `✓ Voice mode ON · STT: ${provider.name} · Hold Space to speak (when prompt is empty)`
+    }
+
+    if (arg === 'off') {
+      keyboardManager.disableVoiceMode()
+      return '✓ Voice mode OFF'
+    }
+
+    // No arg: show status or toggle
+    if (keyboardManager.voiceMode) {
+      keyboardManager.disableVoiceMode()
+      return '✓ Voice mode OFF'
+    }
+
+    // Trying to enable — validate deps
+    if (!soxOk) return '✗ sox not found. Install it: brew install sox (macOS) or apt install sox (Linux)'
+    if (!provider) return '✗ No STT API key. Set GROQ_API_KEY (recommended) or OPENAI_API_KEY.'
+
+    keyboardManager.enableVoiceMode()
+    return `✓ Voice mode ON · STT: ${provider.name} · Hold Space to speak (when prompt is empty)`
+  }
+}
+
+// ============================================================================
 // /terminal-setup command - Configure shell integration
 // ============================================================================
 
@@ -2608,6 +2662,7 @@ export function getLocalCommands() {
     costCommand,
     memoryCommand,
     vimCommand,
+    voiceCommand,
     terminalSetupCommand,
     bugCommand,
     statsCommand,
@@ -2987,6 +3042,7 @@ export default {
   costCommand,
   memoryCommand,
   vimCommand,
+  voiceCommand,
   terminalSetupCommand,
   bugCommand,
   statsCommand,

@@ -20,6 +20,8 @@ class KeyboardManager extends EventEmitter {
     this.rl = null
     // Current input text — updated by callers so Tab completion has context
     this._currentInput = ''
+    // Voice mode state (toggled via /voice command)
+    this._voiceMode = false
   }
 
   /**
@@ -81,6 +83,26 @@ class KeyboardManager extends EventEmitter {
     process.on('exit', () => {
       process.stdin.setRawMode(originalRawMode)
     })
+  }
+
+  /**
+   * Enable voice mode (hold Space to record).
+   */
+  enableVoiceMode() {
+    this._voiceMode = true
+    this.emit('voice-mode-changed', true)
+  }
+
+  /**
+   * Disable voice mode.
+   */
+  disableVoiceMode() {
+    this._voiceMode = false
+    this.emit('voice-mode-changed', false)
+  }
+
+  get voiceMode() {
+    return this._voiceMode
   }
 
   /**

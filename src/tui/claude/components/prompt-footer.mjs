@@ -29,7 +29,7 @@ function getGitInfo() {
   }
 }
 
-export function PromptFooter({ session, prNumber, contextPercent }) {
+export function PromptFooter({ session, prNumber, contextPercent, voiceMode }) {
   const [gitInfo, setGitInfo] = useState(null)
 
   useEffect(() => {
@@ -60,6 +60,11 @@ export function PromptFooter({ session, prNumber, contextPercent }) {
   // PR Link
   if (prNumber) {
     segments.push(React.createElement(Text, { key: 'pr', dimColor: true }, `PR #${prNumber}`))
+  }
+
+  // Voice mode
+  if (voiceMode) {
+    segments.push(React.createElement(Text, { key: 'voice', color: '#E8967E' }, 'voice:on'))
   }
 
   // Context Usage
