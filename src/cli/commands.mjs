@@ -2227,7 +2227,7 @@ export const voiceCommand = {
   async call(closeOverlay, context) {
     const arg = context?.args?.[0]?.toLowerCase()
     const soxInstallHint = process.platform === 'win32'
-      ? 'choco install sox (Windows) or winget install SoX.SoX'
+      ? 'winget install --id sox_ng.sox_ng --exact (recommended) or choco install sox'
       : 'brew install sox (macOS) or apt install sox (Linux)'
 
     // Status check helpers
@@ -2235,7 +2235,7 @@ export const voiceCommand = {
     const provider = await resolveProviderAsync()
 
     if (arg === 'on') {
-      if (!soxOk) return `✗ sox not found. Install it: ${soxInstallHint}`
+      if (!soxOk) return `✗ No recorder binary found (sox_ng, sox, or rec). Install it: ${soxInstallHint}`
       if (!provider) return '✗ No STT API key. Set GROQ_API_KEY (recommended) or OPENAI_API_KEY.'
       keyboardManager.enableVoiceMode()
       return `✓ Voice mode ON · STT: ${provider.name} · Hold Space to speak (when prompt is empty)`
@@ -2253,7 +2253,7 @@ export const voiceCommand = {
     }
 
     // Trying to enable — validate deps
-    if (!soxOk) return `✗ sox not found. Install it: ${soxInstallHint}`
+    if (!soxOk) return `✗ No recorder binary found (sox_ng, sox, or rec). Install it: ${soxInstallHint}`
     if (!provider) return '✗ No STT API key. Set GROQ_API_KEY (recommended) or OPENAI_API_KEY.'
 
     keyboardManager.enableVoiceMode()

@@ -14,7 +14,7 @@
           "PackageIdentifier": "GitHub.cli"
         },
         {
-          "PackageIdentifier": "ChrisBagwell.SoX"
+          "PackageIdentifier": "sox_ng.sox_ng"
         }
       ],
       "SourceDetails": {

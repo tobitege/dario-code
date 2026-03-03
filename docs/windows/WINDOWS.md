@@ -60,10 +60,11 @@ Helper scripts were added:
 
 ### 5. Windows-specific install hints for voice
 
-Voice mode depends on `sox` (SoX = Sound eXchange), which is a command-line audio tool.
+Voice mode depends on a SoX-compatible recorder command (`sox_ng`, `sox`, or `rec`).
+Recommended on Windows: `sox_ng` (actively maintained SoX fork).
 
-In this project, SoX is used to record microphone audio before it is sent to the speech-to-text provider.
-If SoX is missing, voice mode cannot start.
+In this project, the recorder command is used to capture microphone audio before it is sent to the speech-to-text provider.
+If no compatible recorder command is found, voice mode cannot start.
 
 `winget` and `choco` are package managers:
 
@@ -80,16 +81,17 @@ choco --version
 Install SoX on Windows (choose one option):
 
 1. If `winget` is available:
-   - `winget install SoX.SoX`
+   - `winget install --id sox_ng.sox_ng --exact`
 2. If `choco` is available:
    - `choco install sox`
 3. If neither is available, install manually:
-   - Download the Windows SoX build from the official SoX project/release page.
+   - Download a current SoX-compatible Windows build (recommended: SoX_ng release).
    - Install or extract it to a stable folder (example: `C:\Tools\sox`).
    - Add the SoX folder (or its `bin` folder) to your `PATH`.
 4. Close and reopen your terminal.
 5. Verify:
-   - `sox --version`
+   - `sox_ng --version`
+   - If you installed classic SoX instead: `sox --version`
 
 If `sox` is still not found, it is almost always a `PATH` issue.
 
@@ -146,7 +148,7 @@ Tool IDs to include for this repository:
 - `Git.Git` (Git + Git Bash used by shell execution and Git features)
 - `BurntSushi.ripgrep.MSVC` (`rg` used by Grep tool and related tests)
 - `GitHub.cli` (`gh` used by `/pr-comments`)
-- `ChrisBagwell.SoX` (`sox`/`rec` used by voice recording)
+- `sox_ng.sox_ng` (`sox_ng` command used by voice recording; `sox`/`rec` remain fallbacks)
 
 Canonical file in this repository:
 
@@ -158,7 +160,7 @@ Install these directly:
 winget install --id Git.Git --exact
 winget install --id BurntSushi.ripgrep.MSVC --exact
 winget install --id GitHub.cli --exact
-winget install --id ChrisBagwell.SoX --exact
+winget install --id sox_ng.sox_ng --exact
 ```
 
 Then export your local install set:
@@ -237,7 +239,7 @@ This can still fail in restricted contexts, for example:
 
 - Node.js 18+ (22+ works)
 - Git for Windows (for Git Bash support)
-- Optional for voice: SoX
+- Optional for voice: SoX-compatible recorder (`sox_ng` recommended)
 
 ### PowerShell alias
 
@@ -258,9 +260,9 @@ Likely running in `cmd.exe` fallback.
 3. Verify `bash --version` works.
 4. Re-run your command.
 
-### Voice mode says SoX is missing
+### Voice mode says recorder is missing
 
-Install SoX using the steps in section "Windows-specific install hints for voice", then restart terminal and verify with `sox --version`.
+Install SoX-compatible tooling using the steps in section "Windows-specific install hints for voice", then restart terminal and verify with `sox_ng --version` (or `sox --version` for classic SoX).
 
 ### Session errors with malformed project path
 
