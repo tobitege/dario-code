@@ -1,6 +1,6 @@
 {
   "name": "dario-code",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "bin": {
     "dario": "dario.mjs",
     "dario-code": "cli.mjs"
@@ -9,16 +9,16 @@
     "node": ">=18.0.0"
   },
   "type": "module",
-  "author": "Dario Code Contributors",
+  "author": "Jason Kneen",
   "license": "MIT",
-  "description": "Dario Code - An open source CLI coding agent for Claude. Use Claude AI right from your terminal with full codebase understanding.",
-  "homepage": "https://github.com/jkneen/dario-code",
+  "description": "Dario Code - An open source implementation of Claude Code. Use Claude AI right from your terminal with full codebase understanding.",
+  "homepage": "https://github.com/jasonkneen/dario-code",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jkneen/dario-code.git"
+    "url": "https://github.com/jasonkneen/dario-code.git"
   },
   "bugs": {
-    "url": "https://github.com/jkneen/dario-code/issues"
+    "url": "https://github.com/jasonkneen/dario-code/issues"
   },
   "scripts": {
     "start": "./cli.mjs",
