@@ -21,7 +21,10 @@ class VoiceSession extends EventEmitter {
     if (this.isRecording || this.isTranscribing) return
 
     if (!isAvailable()) {
-      this.emit('error', new Error('sox is not installed. Run: brew install sox'))
+      const installHint = process.platform === 'win32'
+        ? 'choco install sox or winget install SoX.SoX'
+        : 'brew install sox'
+      this.emit('error', new Error(`sox is not installed. Run: ${installHint}`))
       return
     }
 
