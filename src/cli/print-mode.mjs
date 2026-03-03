@@ -94,6 +94,7 @@ export async function runPrintMode(prompt, options = {}) {
       isInAllowedDirectory: () => true,
       detectEncoding: utils.detectEncoding,
       detectLineEnding: utils.detectLineEnding,
+      getDefaultLineEnding: utils.getDefaultLineEnding,
       normalizeLineEndings: utils.normalizeLineEndings,
       writeFile: utils.writeFile,
       globFiles: utils.globFiles,

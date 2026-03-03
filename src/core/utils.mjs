@@ -139,7 +139,7 @@ export function detectLineEnding(filePath) {
 /**
  * Get default line ending for the platform
  */
-export async function getDefaultLineEnding(dir) {
+export function getDefaultLineEnding(dir) {
   // Check .editorconfig or use platform default
   const editorConfig = path.join(dir, '.editorconfig')
   if (fileExists(editorConfig)) {

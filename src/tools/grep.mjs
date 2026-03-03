@@ -207,9 +207,14 @@ export function createGrepTool(dependencies) {
       const matchingFiles = await runRipgrep(args, targetDir, abortController.signal)
 
       // Get file stats for sorting by modification time
-      const fileStats = await Promise.all(
-        matchingFiles.map(file => getFileStats(file).catch(() => ({ mtimeMs: 0 })))
-      )
+      // getFileStats is synchronous (statSync), so wrap in try/catch instead of .catch()
+      const fileStats = matchingFiles.map(file => {
+        try {
+          return getFileStats(file)
+        } catch {
+          return { mtimeMs: 0 }
+        }
+      })
 
       // Sort by modification time (most recent first), then by name
       const sortedFiles = matchingFiles

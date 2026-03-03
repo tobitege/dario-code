@@ -311,6 +311,7 @@ export async function* streamConversation(
         case 'content_block_delta':
           const contentIndex = event.index
           const content = currentMessage.message.content[contentIndex]
+          if (!content) break
 
           if (event.delta.type === 'text_delta') {
             content.text += event.delta.text
