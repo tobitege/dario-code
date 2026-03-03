@@ -1626,6 +1626,8 @@ function PromptInput({
   onBypassPermissionsChange,
   queuedMessage = null,
   setQueuedMessage,
+  expandedToolResults = new Set(),
+  onToggleToolResultExpand,
 }) {
   // Internal input state (moved from parent to avoid re-renders)
   const [input, setInput] = useState('')
@@ -1960,6 +1962,24 @@ function PromptInput({
     // Ctrl+B — unified background (CC 2.1 parity)
     if (char === '\x02') {
       backgroundAll()
+      return
+    }
+
+    // Ctrl+O — toggle expand/collapse on the most recent tool result
+    if (char === '\x0f') {
+      if (onToggleToolResultExpand && messages.length > 0) {
+        // Find the most recent tool_result in messages (walk backwards)
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i]
+          if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
+            const toolResult = msg.message.content.find(c => c.type === 'tool_result')
+            if (toolResult) {
+              onToggleToolResultExpand(toolResult.tool_use_id)
+              break
+            }
+          }
+        }
+      }
       return
     }
 
@@ -3337,7 +3357,24 @@ function ConversationApp({
     : null
 
   // Static items: header + completed messages
+  // IMPORTANT: Ink's Static component re-renders ALL items when the items array
+  // reference changes, because its internal useMemo depends on the array ref.
+  // We use a ref to return the SAME array reference when only the streaming
+  // message is updating (staticMessages changes ref but not content).
+  const staticItemsRef = useRef([])
+  const staticItemsLenRef = useRef(0)
+  const staticConfigRef = useRef(null)
+
   const staticItems = useMemo(() => {
+    const configKey = `${forkNumber}-${effectiveVerbose}-${debug}-${isDefaultModel}-${currentModel}-${expandedToolResults.size}`
+    const newLen = 1 + staticMessages.length // header + messages
+
+    // If item count and config haven't changed, return the same array reference
+    // to prevent Ink's Static from re-rendering already-output items.
+    if (newLen === staticItemsLenRef.current && configKey === staticConfigRef.current) {
+      return staticItemsRef.current
+    }
+
     const items = [
       {
         key: `header-${forkNumber}`,
@@ -3374,8 +3411,12 @@ function ConversationApp({
         )
       }))
     ]
+
+    staticItemsRef.current = items
+    staticItemsLenRef.current = newLen
+    staticConfigRef.current = configKey
     return items
-  }, [forkNumber, staticMessages, effectiveVerbose, debug, mcpClients, isDefaultModel, currentModel])
+  }, [forkNumber, staticMessages, effectiveVerbose, debug, mcpClients, isDefaultModel, currentModel, expandedToolResults])
 
   return React.createElement(Box, { flexDirection: 'column' },
     // Static messages — rendered once, never re-rendered (prevents flash)
@@ -3866,7 +3907,8 @@ async function main() {
     processImage: utils.processImage,
     logError: console.error,
     logEvent: () => {},
-    React
+    React,
+    getAvailableTools: async (_dangerouslySkipPermissions) => Object.values(toolObjects)
   })
   let tools = Object.values(toolObjects)
 
