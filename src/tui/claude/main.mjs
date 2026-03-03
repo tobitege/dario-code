@@ -1264,7 +1264,7 @@ function AssistantContentRenderer({
           marginLeft: 2
         },
           React.createElement(Text, null,
-            shouldShowDot && React.createElement(Text, { color: THEME.claude }, '⏺ '),
+            shouldShowDot && React.createElement(Text, { color: THEME.claude }, '● '),  
             param.text
           )
         )
@@ -1279,7 +1279,7 @@ function AssistantContentRenderer({
             ? React.createElement(InsightBlock, { key: idx, content: seg.content })
             : React.createElement(Box, { key: idx, marginLeft: 2 },
                 React.createElement(Text, null,
-                  idx === 0 && shouldShowDot && React.createElement(Text, { color: THEME.claude }, '⏺ '),
+                  idx === 0 && shouldShowDot && React.createElement(Text, { color: THEME.claude }, '● '),  
                   seg.content
                 )
               )
@@ -1289,7 +1289,7 @@ function AssistantContentRenderer({
 
     case 'thinking':
       return React.createElement(Box, {
-        marginTop: addMargin ? 1 : 0,
+        marginTop: 1,
         marginLeft: 2
       },
         React.createElement(Text, { dimColor: true, italic: true },
@@ -1299,7 +1299,7 @@ function AssistantContentRenderer({
 
     case 'redacted_thinking':
       return React.createElement(Box, {
-        marginTop: addMargin ? 1 : 0,
+        marginTop: 1,
         marginLeft: 2
       },
         React.createElement(Text, { dimColor: true, italic: true },
@@ -1387,17 +1387,17 @@ function ToolUseRenderer({
   const isInProgress = inProgressToolUseIDs.has(param.id)
   const isUnresolved = unresolvedToolUseIDs.has(param.id)
 
-  let statusIcon = '⏺'
+  let statusIcon = '●'
   let statusColor = THEME.claude
 
   if (isErrored) {
-    statusIcon = '✗'
+    statusIcon = '●'
     statusColor = THEME.error
   } else if (isInProgress) {
-    statusIcon = '◐'
+    statusIcon = '●'
     statusColor = THEME.suggestion
   } else if (!isUnresolved) {
-    statusIcon = '✓'
+    statusIcon = '●'
     statusColor = THEME.success
   }
 
@@ -1408,7 +1408,7 @@ function ToolUseRenderer({
   },
     React.createElement(Text, null,
       shouldShowDot && React.createElement(Text, { color: statusColor }, statusIcon, ' '),
-      React.createElement(Text, { bold: true, color: THEME.suggestion }, toolName)
+      React.createElement(Text, { bold: true, color: 'white' }, toolName)
     ),
     verbose && param.input && React.createElement(Box, { marginLeft: 2 },
       React.createElement(Text, { dimColor: true },
