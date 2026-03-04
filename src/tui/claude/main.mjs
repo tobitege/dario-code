@@ -3256,7 +3256,11 @@ function ConversationApp({
   useInput((char, key) => {
     if (char === '\x03' || (key?.ctrl && (char === 'c' || char === 'C'))) {
       process.stdout.write('\x1b[?25h') // Show cursor
-      process.exit(0)
+      try {
+        process.kill(process.pid, 'SIGINT')
+      } catch {
+        process.exit(0)
+      }
     }
   }, { isActive: hasBlockingOverlay })
 
